@@ -435,8 +435,10 @@ async function handleFileCallback(
   const { action: act, path, sessionId: sid, page = 0 } = action;
   const effectiveSid = sid || sm.currentSessionId;
 
+  // Answer immediately so Telegram doesn't show a spinner
+  await ctx.answerCallbackQuery().catch(() => {});
+
   if (!effectiveSid && act !== 'cancel' && act !== 'back') {
-    await answerCallback("No active session");
     return;
   }
 
@@ -456,22 +458,12 @@ async function handleFileCallback(
       }
 
       case 'set_cwd': {
-        if (!effectiveSid) {
-          await answerCallback("No active session");
-          return;
-        }
+        if (!effectiveSid) { return; }
         const session = sm.getSession(effectiveSid);
-        if (!session) {
-          await answerCallback("Session not found");
-          return;
-        }
+        if (!session) { return; }
         const stats = await fs.stat(path);
-        if (!stats.isDirectory()) {
-          await answerCallback("Not a directory");
-          return;
-        }
+        if (!stats.isDirectory()) { return; }
         session.cwd = path;
-        await answerCallback(`✅ Session directory set to ${path}`);
         break;
       }
 
@@ -741,12 +733,13 @@ async function handleAcpNotification(
 
   // Permission request → show inline keyboard
   if (method === "session/request_permission" && params) {
+    logger.debug(`[Permission] request: ${JSON.stringify(params).slice(0, 2000)}`);
     const toolCall = params.toolCall as Record<string, unknown> | undefined;
     const options = params.options as { optionId: string; name: string }[] | undefined;
     if (options) {
       const toolName = toolCall?.name as string || toolCall?.toolCallId as string || "unknown";
       const input = toolCall?.input as Record<string, unknown> | undefined;
-      const inputStr = input ? "\n`" + JSON.stringify(input).slice(0, 500) + "`" : "";
+      const inputStr = input ? formatToolInput(toolName, input) : "";
       const kb = new InlineKeyboard();
       for (const o of options) {
         kb.text(o.name, `perm:${m.id}:${o.optionId}`);
@@ -828,4 +821,31 @@ export function extractTodos(text: string): string[] {
     if (m) lines.push(m[1]);
   }
   return lines;
+}
+
+function formatToolInput(toolName: string, input: Record<string, unknown>): string {
+  if (toolName === "bash" || toolName === "execute") {
+    const cmd = input.command as string || input.code as string || "";
+    if (cmd) return `\n\`\`\`bash\n$ ${cmd.slice(0, 1000)}\n\`\`\``;
+  }
+  if (toolName === "read") {
+    const fp = input.filePath as string || input.path as string || "";
+    if (fp) return `\n📄 \`${fp.slice(0, 300)}\``;
+  }
+  if (toolName === "write" || toolName === "edit") {
+    const fp = input.filePath as string || input.path as string || "";
+    const s = input.content as string || input.oldString as string || "";
+    const preview = s ? "\n```\n" + s.slice(0, 200) + (s.length > 200 ? "..." : "") + "\n```" : "";
+    if (fp) return `\n✏️ \`${fp.slice(0, 300)}\`${preview}`;
+  }
+  if (toolName === "search" || toolName === "grep") {
+    const q = input.query as string || input.pattern as string || "";
+    if (q) return `\n🔍 \`${q.slice(0, 300)}\``;
+  }
+  if (toolName === "glob") {
+    const p = input.pattern as string || "";
+    if (p) return `\n🔎 \`${p.slice(0, 300)}\``;
+  }
+  const fallback = JSON.stringify(input).slice(0, 500);
+  return fallback ? `\n\`${fallback}\`` : "";
 }
