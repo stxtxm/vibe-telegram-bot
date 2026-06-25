@@ -1,0 +1,65 @@
+{
+  "todos": [
+    {
+      "id": 2,
+      "text": "First",
+      "done": false,
+      "createdAt": "2026-06-24T18:03:31.091Z"
+    },
+    {
+      "id": 3,
+      "text": "Second",
+      "done": false,
+      "createdAt": "2026-06-24T18:03:31.092Z"
+    },
+    {
+      "id": 4,
+      "text": "Task",
+      "done": false,
+      "createdAt": "2026-06-24T18:03:31.101Z"
+    },
+    {
+      "id": 5,
+      "text": "Task",
+      "done": false,
+      "createdAt": "2026-06-24T18:03:31.104Z"
+    },
+    {
+      "id": 6,
+      "text": "Task 1",
+      "done": false,
+      "createdAt": "2026-06-24T18:03:31.109Z"
+    },
+    {
+      "id": 7,
+      "text": "Task 2",
+      "done": false,
+      "createdAt": "2026-06-24T18:03:31.110Z"
+    },
+    {
+      "id": 8,
+      "text": "Pending task",
+      "done": false,
+      "createdAt": "2026-06-24T18:03:31.113Z"
+    },
+    {
+      "id": 9,
+      "text": "Another pending",
+      "done": false,
+      "createdAt": "2026-06-24T18:03:31.113Z"
+    },
+    {
+      "id": 10,
+      "text": "Persistent task",
+      "done": false,
+      "createdAt": "2026-06-24T18:03:31.118Z"
+    },
+    {
+      "id": 11,
+      "text": "Another",
+      "done": false,
+      "createdAt": "2026-06-24T18:03:31.118Z"
+    }
+  ],
+  "nextId": 12
+}

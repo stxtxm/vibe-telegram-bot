@@ -1,0 +1,3 @@
+[console_scripts]
+vibe = vibe.cli.entrypoint:main
+vibe-acp = vibe.acp.entrypoint:main
