@@ -9,7 +9,7 @@ import type { JsonRpcResponse, JsonRpcNotification } from "./protocol.js";
 type MessageHandler = (msg: JsonRpcResponse | JsonRpcNotification) => void;
 type DisconnectHandler = () => void;
 
-const REQUEST_TIMEOUT = 600_000; // 10 minutes
+const REQUEST_TIMEOUT = 1_800_000; // 30 minutes
 
 function loadMistralKey(): string | undefined {
   try {
@@ -26,6 +26,8 @@ export class AcpClient {
   private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
   private msgHandler: MessageHandler | null = null;
   private disconnectHandler: DisconnectHandler | null = null;
+  private stderrBuffer = "";
+  private stderrLineCount = 0;
 
   onMessage(h: MessageHandler) { this.msgHandler = h; }
   onDisconnect(h: DisconnectHandler) { this.disconnectHandler = h; }
@@ -56,7 +58,16 @@ export class AcpClient {
     this.rl.on("line", (line) => this.onLine(line));
 
     this.proc.stderr!.on("data", (d: Buffer) => {
-      const t = d.toString().trim();
+      const chunk = d.toString();
+      this.stderrBuffer += chunk;
+      this.stderrLineCount += chunk.split("\n").length - 1;
+      // Keep only last ~30 lines
+      if (this.stderrLineCount > 60) {
+        const lines = this.stderrBuffer.split("\n");
+        this.stderrBuffer = lines.slice(-30).join("\n");
+        this.stderrLineCount = 30;
+      }
+      const t = chunk.trim();
       if (t) logger.debug(`[ACP stderr] ${t}`);
     });
 
@@ -85,7 +96,17 @@ export class AcpClient {
         if (cb) {
           this.pending.delete(id);
           if (msg.error) {
-            cb.reject(new Error(`RPC ${msg.error.code}: ${msg.error.message}`));
+            let detail = msg.error.message || "";
+            if (msg.error.data) {
+              const dataStr = typeof msg.error.data === "string" ? msg.error.data : JSON.stringify(msg.error.data);
+              if (dataStr !== detail) detail += ` — ${dataStr.slice(0, 500)}`;
+            }
+            // Attach recent stderr if error has no useful detail
+            if ((!detail || detail === "Internal error") && this.stderrBuffer) {
+              const last = this.stderrBuffer.split("\n").filter(Boolean).slice(-3).join("; ");
+              if (last) detail += ` [stderr: ${last.slice(0, 300)}]`;
+            }
+            cb.reject(new Error(`RPC ${msg.error.code}: ${detail || "Internal error"}`));
           } else {
             cb.resolve(msg.result);
           }
@@ -148,6 +169,11 @@ export class AcpClient {
     return this.request("session/new", { cwd, mcpServers: [] });
   }
 
+  async loadSession(sessionId: string, cwd: string): Promise<unknown> {
+    logger.info(`[ACP] loadSession ${sessionId.slice(0, 8)}...`);
+    return this.request("session/load", { sessionId, cwd, mcpServers: [] });
+  }
+
   async setModel(sessionId: string, modelId: string): Promise<unknown> {
     logger.info(`[ACP] setModel ${sessionId.slice(0, 8)}... -> ${modelId}`);
     return this.request("session/set_model", { sessionId, modelId });
@@ -204,6 +230,10 @@ export class AcpClient {
   async setTitle(sessionId: string, title: string): Promise<unknown> {
     logger.info(`[ACP] setTitle ${sessionId.slice(0, 8)}... -> ${title}`);
     return this.request("_session/set_title", { sessionId, title });
+  }
+
+  getRecentStderr(): string {
+    return this.stderrBuffer;
   }
 
   stop(): void {

@@ -57,6 +57,16 @@ describe("splitMessage", () => {
     const text = "a".repeat(4096);
     expect(splitMessage(text)).toHaveLength(1);
   });
+
+  it("should break at newline when possible", () => {
+    const a = "x".repeat(3000);
+    const b = "y".repeat(3000);
+    const text = a + "\n" + b;
+    const result = splitMessage(text, 4000);
+    expect(result).toHaveLength(2);
+    expect(result[0]).toBe(a + "\n");
+    expect(result[1]).toBe(b);
+  });
 });
 
 describe("extractTodos", () => {

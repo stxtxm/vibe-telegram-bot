@@ -217,11 +217,43 @@ bot.on("callback_query:data", async (ctx) => {
 ### Important Considerations
 
 1. **Single User**: The bot is designed for a single user (specified by `TELEGRAM_ALLOWED_USER_ID`)
-2. **Session State**: Session state is stored in memory (not persisted across restarts)
+2. **Session State**: Session state is stored in memory; loaded from ACP server on startup via `session/load`
 3. **Todo Persistence**: Todos are stored in `data/todos.json`
 4. **Permission Handling**: Tool permissions have a 10-minute timeout
 5. **Progress Updates**: Progress messages are rate-limited (1 second minimum between updates)
 6. **Message Splitting**: Long messages are automatically split to fit Telegram's 4096 character limit
+7. **Typing Indicator**: `startTypingInterval` sends `sendChatAction(chatId, "typing")` every 4s while processing
+8. **Cancel + Retry**: When busy, a new user message cancels the current prompt (notification) and starts fresh
+9. **Stale Guard**: A generation counter prevents stale prompt completions from showing errors or resetting state
+
+### Process Safety - CRITICAL
+
+This project shares the server with other Telegram bots:
+- `/home/timo/dev/telegram-bots/bot1/` → an OpenCode bot
+- `/home/timo/dev/telegram-bots/bot2/` → an OpenCode bot (like opencode itself)
+- `/home/timo/dev/telegram-bots/bot3/` → another project
+- `/home/timo/dev/telegram-bots/vibe-telegram-bot/` → **this project** (ACP protocol, not OpenCode)
+
+**Rules (never violate):**
+
+1. **Never use `pkill`, `killall`, or any broad process matching.** These will kill other bots. All bots run as `node dist/index.js` — matching by process name is unsafe.
+
+2. **Always stop/restart using the PID lock file:**
+   ```bash
+   kill $(cat /tmp/vibe-telegram-bot.pid)
+   ```
+   To verify the lock file exists:
+   ```bash
+   cat /tmp/vibe-telegram-bot.pid
+   ```
+
+3. **The PID lock mechanism** (`/tmp/vibe-telegram-bot.pid`):
+   - Written at startup in `src/index.ts:checkLock()`
+   - If another instance with the same PID file is alive, the new instance exits immediately
+   - Cleaned up on `SIGINT`, `SIGTERM`, `exit`, and fatal errors
+   - Stale locks (PID no longer alive) are detected and overwritten
+
+4. **Do NOT edit files outside this project directory** (`/home/timo/dev/telegram-bots/vibe-telegram-bot/`). The other bot directories belong to separate projects with different architectures.
 
 ### Debugging Tips
 
@@ -245,9 +277,8 @@ bot.on("callback_query:data", async (ctx) => {
 ### Known Limitations
 
 1. **No Multi-User Support**: Only one user ID is allowed
-2. **No Session Persistence**: Sessions are lost on bot restart
-3. **No Conversation History**: Only current prompt responses are shown
-4. **Basic Rate Limiting**: Only basic protection against Telegram rate limits
+2. **No Conversation History**: Only current prompt responses are shown
+3. **Basic Rate Limiting**: Only basic protection against Telegram rate limits
 
 ### Future Enhancements
 

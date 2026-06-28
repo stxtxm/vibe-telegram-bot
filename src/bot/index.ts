@@ -34,14 +34,26 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
   let progressMessageId: number | null = null;
   let progressText = "";
   let lastFlushTime = 0;
-  let seenToolCalls = new Set<string>();
+  let toolCallMap = new Map<string, { name: string; kind: string; input?: Record<string, unknown> }>();
+  let promptGeneration = 0;
 
   // Permission state
   let pendingPermission: { id: number; sessionId: string } | null = null;
   let permissionTimeout: ReturnType<typeof setTimeout> | null = null;
 
+  function startTypingInterval(chatId: number): () => void {
+    const interval = setInterval(() => {
+      bot.api.sendChatAction(chatId, "typing").catch(() => {});
+    }, 4000);
+    bot.api.sendChatAction(chatId, "typing").catch(() => {});
+    return () => clearInterval(interval);
+  }
+
   // === AUTH MIDDLEWARE ===
   bot.use(async (ctx, next) => {
+    if (ctx.callbackQuery) {
+      logger.info(`[Middleware] callbackQuery data="${ctx.callbackQuery.data}"`);
+    }
     if (ctx.from?.id !== config.telegram.allowedUserId) {
       logger.warn(`[Auth] Rejected ${ctx.from?.id}`);
       return;
@@ -52,7 +64,6 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
   // === COMMANDS ===
   bot.api.setMyCommands([
     { command: "start", description: "Create a Vibe session" },
-    { command: "new", description: "Create a new session" },
     { command: "model", description: "Switch AI model" },
     { command: "mode", description: "Switch agent mode" },
     { command: "thinking", description: "Set thinking budget" },
@@ -69,7 +80,6 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
   ]);
 
   bot.command("start", startHandler(sessionManager));
-  bot.command("new", newHandler(sessionManager));
   bot.command("model", modelHandler(sessionManager));
   bot.command("mode", modeHandler(sessionManager));
   bot.command("thinking", thinkingHandler(sessionManager));
@@ -85,10 +95,13 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     (v) => { progressChatId = v; },
     (v) => { progressMessageId = v; },
     (v) => { progressText = v; },
-    (v) => { seenToolCalls = v; }
+    (v) => { toolCallMap = v; },
+    () => permissionTimeout,
+    (v) => { permissionTimeout = v; },
+    () => { pendingPermission = null; },
   ));
   bot.command("rename", renameHandler(acpClient, sessionManager));
-  bot.command("status", statusHandler(sessionManager));
+  bot.command("status", statusHandler(sessionManager, () => pendingPermission, () => busy));
   bot.command("todo", todoHandler(todoManager));
   bot.command("help", helpHandler);
 
@@ -99,66 +112,132 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
 
     const sid = sessionManager.currentSessionId;
     if (!sid) { await ctx.reply("No session. Use /start."); return; }
-    if (busy) { await ctx.reply("⏳ Busy, wait..."); return; }
 
+    // Cancel any running prompt and start fresh
+    if (busy) {
+      if (pendingPermission) {
+        logger.info(`[Permission] Auto-rejected id=${pendingPermission.id} (new prompt)`);
+        if (permissionTimeout) { clearTimeout(permissionTimeout); permissionTimeout = null; }
+        acpClient.respondPermissionError(pendingPermission.id);
+        pendingPermission = null;
+      }
+      acpClient.cancelPrompt(sid);
+    }
+
+    const generation = ++promptGeneration;
     busy = true;
     progressText = "";
-    seenToolCalls = new Set();
+    toolCallMap = new Map();
 
     const statusMsg = await ctx.reply("⏳ Thinking...");
     progressChatId = statusMsg.chat.id;
     progressMessageId = statusMsg.message_id;
+    const stopTyping = startTypingInterval(statusMsg.chat.id);
 
-    try {
-      await acpClient.sendPrompt(sid, text);
-
-      // Prompt finished – send accumulated text and usage
-      const chatId = ctx.chat.id;
-      if (progressText) {
-        for (const chunk of splitMessage(progressText)) {
-          try { await ctx.reply(chunk, { parse_mode: "Markdown" }); }
-          catch { await ctx.reply(chunk); }
-        }
-      }
-
-      // Auto-create todos from response
-      if (todoManager && progressText) {
-        const todoLines = extractTodos(progressText);
-        for (const todoText of todoLines) {
-          await todoManager.add(todoText);
-        }
-        if (todoLines.length > 0) {
-          await ctx.reply(`📋 ${todoLines.length} todo(s) ajoutée(s) automatiquement. /todo pour voir.`);
-        }
-      }
-
-      await ctx.reply("✅ Terminé");
-      busy = false;
-      setTimeout(() => { busy = false; }, PROMPT_TIMEOUT);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("Session not found")) {
-        await ctx.reply("⚠️ Session introuvable. Création d'une nouvelle session...");
-        try {
-          await sessionManager.createSession(config.vibe.projectDir);
-          busy = false;
-          return;
-        } catch (createErr) {
-          await ctx.reply(`❌ Impossible de créer une session: ${createErr instanceof Error ? createErr.message : String(createErr)}`);
-        }
-      } else {
-        await ctx.reply(`❌ ${msg}`);
-      }
-      busy = false;
-    }
-
-    progressChatId = null;
-    progressMessageId = null;
-    progressText = "";
+    runPrompt(acpClient, ctx, sid, generation, stopTyping).catch((err) => {
+      logger.error("[Prompt] Background error:", err);
+    });
   });
 
+  async function runPrompt(acpClient: AcpClient, ctx: Context, sid: string, generation: number, stopTyping?: () => void, retry = 0) {
+    const text = ctx.message?.text;
+    if (!text) return;
+    let recovered = false;
+    try {
+      const result = await acpClient.sendPrompt(sid, text) as Record<string, unknown> | undefined;
+
+      // Stale — a newer prompt has superseded this one
+      if (generation < promptGeneration) {
+        logger.debug(`[Prompt] Stale generation ${generation} < ${promptGeneration}, ignoring result`);
+        return;
+      }
+
+      const toolSummary = buildToolSummary(toolCallMap);
+
+      // Edit progress message to show done status (no truncated text)
+      if (progressChatId && progressMessageId) {
+        const doneLine = toolSummary ? `✅ **Done** — ${toolSummary}` : "✅ **Done**";
+        try {
+          await bot.api.editMessageText(progressChatId, progressMessageId, doneLine, { parse_mode: "Markdown" });
+        } catch (e) {
+          logger.warn("[Bot] Failed to edit final progress:", e);
+        }
+      }
+
+      // Send ALL agent output as clean messages with Markdown fallback
+      if (progressText) {
+        for (const chunk of splitMessage(progressText)) {
+          await replyWithFallback(ctx, chunk);
+        }
+      } else {
+        const resultText = extractAgentText(result);
+        if (resultText) {
+          for (const chunk of splitMessage(resultText)) {
+            await replyWithFallback(ctx, chunk);
+          }
+        } else if (!toolSummary) {
+          await ctx.reply("✅ Done");
+        }
+      }
+      if (toolSummary) {
+        await replyWithFallback(ctx, toolSummary);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+
+      // Stale — a newer prompt has superseded this one
+      if (generation < promptGeneration) {
+        logger.debug(`[Prompt] Stale generation ${generation} < ${promptGeneration}, ignoring`);
+        return;
+      }
+
+      const stderr = acpClient.getRecentStderr?.() || "";
+      if (stderr) logger.warn("[Bot] ACP stderr during error:\n" + stderr.slice(-1000));
+
+      // Session not found — try to reload from disk, then create new if that fails
+      if (msg.includes("Session not found") && retry < 1) {
+        const lastCwd = sessionManager.current?.cwd || config.vibe.projectDir;
+        try {
+          await sessionManager.loadSession(sid, lastCwd);
+          progressText = "";
+          toolCallMap = new Map();
+          await ctx.reply(`🔄 Session rechargée. Je relance...`);
+          recovered = true;
+          await runPrompt(acpClient, ctx, sid, generation, stopTyping, retry + 1);
+          return;
+        } catch (loadErr) {
+          logger.warn(`[Bot] Session ${sid.slice(0, 8)}... load failed, creating new:`, loadErr);
+        }
+        try {
+          const newSid = await sessionManager.createSession(lastCwd);
+          progressText = "";
+          toolCallMap = new Map();
+          await ctx.reply(`🔄 Nouvelle session créée. Je relance...`);
+          recovered = true;
+          await runPrompt(acpClient, ctx, newSid, generation, stopTyping, retry + 1);
+          return;
+        } catch (createErr) {
+          logger.error("[Bot] Session recovery failed:", createErr);
+          await ctx.reply("❌ Session expirée et impossible d'en créer une nouvelle");
+        }
+      } else {
+        logger.error("[Bot] Prompt error:", msg);
+        await ctx.reply(`❌ ${msg}`);
+      }
+    } finally {
+      stopTyping?.();
+      if (!recovered && generation >= promptGeneration) {
+        busy = false;
+        progressChatId = null;
+        progressMessageId = null;
+      }
+    }
+  }
+
   // === CALLBACK QUERY HANDLER ===
-  bot.on("callback_query:data", async (ctx) => {
+  // Handle ALL callback queries with regex catcher
+  bot.callbackQuery(/.*/, async (ctx) => {
+    await ctx.answerCallbackQuery().catch(() => {});
     const data = ctx.callbackQuery.data;
     logger.info(`[Callback] data="${data}" user=${ctx.from?.id}`);
     const sid = sessionManager.currentSessionId;
@@ -182,7 +261,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
           pendingPermission = null;
         } else {
           logger.warn(`[Permission] Expired or mismatched: got id=${permId} expected=${pendingPermission?.id}`);
-          await ctx.answerCallbackQuery({ text: "⏳ Permission expirée" }).catch(() => {});
+          await ctx.answerCallbackQuery({ text: "⏳ Expiré, envoie un message" }).catch(() => {});
         }
         return;
       }
@@ -281,6 +360,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
         action,
         ctx,
         sessionManager,
+        acpClient,
         (menu) => ctx.editMessageText(menu.text, {
           parse_mode: "Markdown",
           reply_markup: menu.keyboard,
@@ -292,6 +372,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     }
 
     await ctx.answerCallbackQuery({ text: "Unknown action" }).catch(() => {});
+    logger.warn(`[Callback] Unhandled callback data="${data}"`);
   });
 
   // === ACP NOTIFICATIONS ===
@@ -322,7 +403,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
           permissionTimeout = null;
         }, 600_000); // 10 minutes
       }
-    }, seenToolCalls).catch((err) => {
+    }, toolCallMap).catch((err) => {
       logger.error("[Bot] notification error:", err);
     });
   });
@@ -428,6 +509,7 @@ async function handleFileCallback(
   action: FileAction,
   ctx: Context,
   sm: SessionManager,
+  acpClient: AcpClient,
   editMessage: (menu: { text: string; keyboard: InlineKeyboard }) => Promise<unknown>,
   answerCallback: (text: string) => Promise<unknown>,
   sendMessage: (text: string) => Promise<unknown>,
@@ -463,7 +545,10 @@ async function handleFileCallback(
         if (!session) { return; }
         const stats = await fs.stat(path);
         if (!stats.isDirectory()) { return; }
-        session.cwd = path;
+        await sm.updateCwd(effectiveSid, path);
+        acpClient.setConfigOption(effectiveSid, 'cwd', path).catch(() => {});
+        await ctx.deleteMessage().catch(() => {});
+        await ctx.reply(`✅ Session directory changed to \`${path}\``, { parse_mode: "Markdown" });
         break;
       }
 
@@ -496,38 +581,17 @@ async function handleFileCallback(
 function startHandler(sm: SessionManager) {
   return async (ctx: Context) => {
     try {
-      const initialCwd = config.vibe.projectDir;
-      await sm.createSession(initialCwd);
+      const currentSession = sm.current;
+      const nextCwd = currentSession?.cwd || config.vibe.projectDir;
+      await sm.createSession(nextCwd);
       const s = sm.current;
       if (!s) throw new Error("No session created");
-
-      const m = s.models?.currentModelId || "?";
-      const mode = s.modes?.currentModeId || "?";
       await ctx.reply(
-        `✅ **Session created!**\n📍 Directory: \`${s.cwd}\`\n🤖 Model: \`${m}\`\n🎯 Mode: \`${mode}\``,
+        `✅ **Session created!**\n📍 Directory: \`${s.cwd}\`\nUse /files to browse`,
         { parse_mode: "Markdown" },
       );
     } catch (err) {
       await ctx.reply(`❌ ${err instanceof Error ? err.message : String(err)}`);
-    }
-  };
-}
-
-function newHandler(sm: SessionManager) {
-  return async (ctx: Context) => {
-    try {
-      const currentSession = sm.current;
-      const nextCwd = currentSession?.cwd || config.vibe.projectDir;
-      await sm.createSession(nextCwd);
-      const newSession = sm.current;
-      if (!newSession) throw new Error("Failed to create session");
-
-      await ctx.reply(
-        `✅ **New session created!**\n📍 Directory: \`${newSession.cwd}\`\nUse /files to browse`,
-        { parse_mode: "Markdown" }
-      );
-    } catch (err) {
-      await ctx.reply("❌ " + (err instanceof Error ? err.message : String(err)));
     }
   };
 }
@@ -593,13 +657,20 @@ function abortHandler(
   setProgressChatId: (v: number | null) => void,
   setProgressMessageId: (v: number | null) => void,
   setProgressText: (v: string) => void,
-  setSeenToolCalls: (v: Set<string>) => void
+  setToolCallMap: (v: Map<string, { name: string; kind: string; input?: Record<string, unknown> }>) => void,
+  getPermissionTimeout?: () => ReturnType<typeof setTimeout> | null,
+  setPermissionTimeout?: (v: ReturnType<typeof setTimeout> | null) => void,
+  clearPendingPermission?: () => void,
 ) {
   return async (ctx: Context) => {
     const sid = sm.currentSessionId;
     if (!sid) { await ctx.reply("No active session."); return; }
     
-    // Toujours annuler la tâche côté ACP, peu importe l'état local
+    // Annuler la permission en attente si elle existe
+    const pt = getPermissionTimeout?.();
+    if (pt) { clearTimeout(pt); setPermissionTimeout?.(null); }
+    clearPendingPermission?.();
+    
     acp.cancelPrompt(sid);
     
     // Réinitialiser TOUT l'état de progression
@@ -607,7 +678,7 @@ function abortHandler(
     setProgressChatId(null);
     setProgressMessageId(null);
     setProgressText("");
-    setSeenToolCalls(new Set());
+    setToolCallMap(new Map());
     
     await ctx.reply("⏹️ Prompt aborted.");
   };
@@ -629,7 +700,11 @@ function renameHandler(acp: AcpClient, sm: SessionManager) {
   };
 }
 
-function statusHandler(sm: SessionManager) {
+function statusHandler(
+  sm: SessionManager,
+  getPendingPermission?: () => { id: number; sessionId: string } | null,
+  getBusy?: () => boolean,
+) {
   return async (ctx: Context) => {
     const s = sm.current;
     if (!s) { await ctx.reply("No session. Use /start."); return; }
@@ -638,15 +713,19 @@ function statusHandler(sm: SessionManager) {
     const thinking = s.configOptions?.find((o) => o.id === "thinking")?.currentValue || "?";
     const title = s.title || s.id.slice(0, 8);
     const directory = s.cwd || config.vibe.projectDir;
-    await ctx.reply(
-      `🤖 **Session**\n` +
+    let status = `🤖 **Session**\n` +
       `Title: \`${title}\`\n` +
       `📍 Directory: \`${directory}\`\n` +
       `🤖 Model: \`${model}\`\n` +
       `🎯 Mode: \`${mode}\`\n` +
-      `💭 Thinking: \`${thinking}\``,
-      { parse_mode: "Markdown" },
-    );
+      `💭 Thinking: \`${thinking}\``;
+    if (getBusy?.()) {
+      status += `\n\n⏳ **Busy**`;
+      if (getPendingPermission?.()) {
+        status += ` — permission en attente (envoie un message pour annuler)`;
+      }
+    }
+    await ctx.reply(status, { parse_mode: "Markdown" });
   };
 }
 
@@ -655,7 +734,6 @@ const helpHandler = async (ctx: Context) => {
     "🤖 **Vibe Bot**\n\n" +
     "**Session Management**\n" +
     "/start - Create a Vibe session\n" +
-    "/new - Create a new session\n" +
     "/sessions - List/switch sessions\n" +
     "/close - Close current session\n" +
     "/rename <title> - Rename session\n" +
@@ -724,7 +802,7 @@ async function handleAcpNotification(
   getProgressText: () => string,
   flushProgress: () => void,
   setPendingPermission: (p: { id: number; sessionId: string } | null) => void,
-  seenToolCalls: Set<string>,
+  toolCallMap: Map<string, { name: string; kind: string; input?: Record<string, unknown> }>,
 ): Promise<void> {
   const m = msg as Record<string, unknown>;
   const method = m.method as string | undefined;
@@ -733,13 +811,16 @@ async function handleAcpNotification(
 
   // Permission request → show inline keyboard
   if (method === "session/request_permission" && params) {
-    logger.debug(`[Permission] request: ${JSON.stringify(params).slice(0, 2000)}`);
     const toolCall = params.toolCall as Record<string, unknown> | undefined;
     const options = params.options as { optionId: string; name: string }[] | undefined;
     if (options) {
-      const toolName = toolCall?.name as string || toolCall?.toolCallId as string || "unknown";
-      const input = toolCall?.input as Record<string, unknown> | undefined;
-      const inputStr = input ? formatToolInput(toolName, input) : "";
+      // Look up stored tool call details by toolCallId
+      const toolCallId = toolCall?.toolCallId as string || "";
+      const stored = toolCallId ? toolCallMap.get(toolCallId) : undefined;
+      const toolName = stored?.name || toolCall?.name as string || toolCallId || "unknown";
+      const kindLabel = stored?.kind && stored?.kind !== toolName ? ` (${stored.kind})` : "";
+      const inputStr = stored?.input ? formatToolInput(toolName, stored.input) : "";
+      logger.info(`[Permission] id=${m.id} toolCallId=${toolCallId} toolName=${toolName} stored=${!!stored} inputStr=${!!inputStr}`);
       const kb = new InlineKeyboard();
       for (const o of options) {
         kb.text(o.name, `perm:${m.id}:${o.optionId}`);
@@ -747,9 +828,11 @@ async function handleAcpNotification(
       // Register permission BEFORE sending — ensures it's tracked even if Telegram API fails
       setPendingPermission({ id: m.id as number, sessionId: params.sessionId as string });
       await bot.api.sendMessage(chatId,
-        `🔒 **${toolName}**${inputStr}`,
+        `🔒 **${toolName}**${kindLabel}${inputStr}`,
         { parse_mode: "Markdown", reply_markup: kb },
-      ).catch((err) => {
+      ).then(() => {
+        logger.info(`[Permission] Message sent for id=${m.id}`);
+      }).catch((err) => {
         logger.error(`[Permission] Failed to send message for id=${m.id}:`, err);
       });
     }
@@ -770,23 +853,36 @@ async function handleAcpNotification(
       const content = update.content as Record<string, unknown> | undefined;
       const text = content?.text as string | undefined;
       if (text) {
+        logger.debug(`[Progress] chunk ${text.length} chars`);
         appendProgress(text);
         flushProgress();
       } else {
-        logger.debug("[ACP msg_chunk]", JSON.stringify(update));
+        logger.debug("[ACP msg_chunk] no text", JSON.stringify(update).slice(0, 300));
       }
       return;
     }
 
     if (sessionUpdate === "tool_call") {
       const toolCallId = update.toolCallId as string;
-      if (!toolCallId || seenToolCalls.has(toolCallId)) return;
-      seenToolCalls.add(toolCallId);
+      if (!toolCallId) return;
       const toolName = (update._meta as Record<string, unknown> | undefined)?.tool_name as string || update.title as string;
       const kind = update.kind as string || "";
-      const emoji = TOOL_EMOJI[toolName] || "🔧";
-      const kindLabel = kind && kind !== toolName ? ` (${kind})` : "";
-      await bot.api.sendMessage(chatId, `${emoji} \`${toolName}\`${kindLabel}`, { parse_mode: "Markdown" });
+      let input: Record<string, unknown> | undefined;
+      const rawInput = update.rawInput;
+      if (typeof rawInput === "string") {
+        try { input = JSON.parse(rawInput); } catch { input = undefined; }
+      } else if (rawInput && typeof rawInput === "object") {
+        input = rawInput as Record<string, unknown>;
+      }
+      logger.debug(`[ToolCall] id=${toolCallId} name=${toolName} kind=${kind} input=${JSON.stringify(input)}`);
+      // Store/update tool call details — vibe-acp sends two notifications:
+      // first with rawInput=null (pending), second with real data (running)
+      const existing = toolCallMap.get(toolCallId);
+      if (input) {
+        toolCallMap.set(toolCallId, { name: toolName, kind, input });
+      } else if (!existing) {
+        toolCallMap.set(toolCallId, { name: toolName, kind, input: undefined });
+      }
       return;
     }
 
@@ -807,8 +903,51 @@ async function handleAcpNotification(
 export function splitMessage(text: string, max = 4096): string[] {
   if (text.length <= max) return [text];
   const out: string[] = [];
-  for (let i = 0; i < text.length; i += max) out.push(text.slice(i, i + max));
+  let start = 0;
+  while (start < text.length) {
+    if (start + max >= text.length) {
+      out.push(text.slice(start));
+      break;
+    }
+    const end = start + max;
+    const nl = text.lastIndexOf("\n", end);
+    if (nl > start) {
+      // Break after the newline
+      out.push(text.slice(start, nl + 1));
+      start = nl + 1;
+    } else {
+      // No newline found, hard break
+      out.push(text.slice(start, end));
+      start = end;
+    }
+  }
   return out;
+}
+
+function buildToolSummary(map: Map<string, { name: string; kind: string; input?: Record<string, unknown> }>): string {
+  const counts = new Map<string, number>();
+  for (const [, v] of map) {
+    const name = v.kind === "write" || v.kind === "edit" || v.kind === "read" ? "file" : v.kind;
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  if (counts.size === 0) return "";
+  return Array.from(counts).map(([name, count]) => `${TOOL_EMOJI[name] || "🛠️"} ${name} ×${count}`).join("  ");
+}
+
+async function replyWithFallback(ctx: Context, text: string): Promise<void> {
+  try {
+    await ctx.reply(text, { parse_mode: "Markdown" });
+  } catch {
+    try { await ctx.reply(text); } catch (e) { logger.warn("[Bot] Failed to send text:", e); }
+  }
+}
+
+function extractAgentText(result: Record<string, unknown> | undefined): string | undefined {
+  if (!result) return undefined;
+  // PromptResponse has stop_reason, usage – no text content
+  // The actual response comes via agent_message_chunk events
+  if (result.stopReason === "cancelled") return undefined;
+  return undefined;
 }
 
 /** Extract todo items from agent response – lines starting with "- [ ]" or "TODO:" */
@@ -823,29 +962,27 @@ export function extractTodos(text: string): string[] {
   return lines;
 }
 
+function escapeMarkdown(text: string): string {
+  return text.replace(/([_*\[\]()~`>#+\-=|{}.!])/g, "\\$1");
+}
+
 function formatToolInput(toolName: string, input: Record<string, unknown>): string {
+  const fp = input.filePath as string || input.path as string || input.file_path as string || "";
   if (toolName === "bash" || toolName === "execute") {
     const cmd = input.command as string || input.code as string || "";
     if (cmd) return `\n\`\`\`bash\n$ ${cmd.slice(0, 1000)}\n\`\`\``;
   }
-  if (toolName === "read") {
-    const fp = input.filePath as string || input.path as string || "";
-    if (fp) return `\n📄 \`${fp.slice(0, 300)}\``;
-  }
-  if (toolName === "write" || toolName === "edit") {
-    const fp = input.filePath as string || input.path as string || "";
-    const s = input.content as string || input.oldString as string || "";
-    const preview = s ? "\n```\n" + s.slice(0, 200) + (s.length > 200 ? "..." : "") + "\n```" : "";
-    if (fp) return `\n✏️ \`${fp.slice(0, 300)}\`${preview}`;
+  if (toolName === "read" || toolName === "write" || toolName === "edit") {
+    if (fp) return `\n📄 \`${escapeMarkdown(fp.slice(0, 300))}\``;
   }
   if (toolName === "search" || toolName === "grep") {
     const q = input.query as string || input.pattern as string || "";
-    if (q) return `\n🔍 \`${q.slice(0, 300)}\``;
+    if (q) return `\n🔍 \`${escapeMarkdown(q.slice(0, 300))}\``;
   }
   if (toolName === "glob") {
     const p = input.pattern as string || "";
-    if (p) return `\n🔎 \`${p.slice(0, 300)}\``;
+    if (p) return `\n🔎 \`${escapeMarkdown(p.slice(0, 300))}\``;
   }
   const fallback = JSON.stringify(input).slice(0, 500);
-  return fallback ? `\n\`${fallback}\`` : "";
+  return fallback ? `\n\`${escapeMarkdown(fallback)}\`` : "";
 }

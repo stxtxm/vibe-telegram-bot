@@ -143,8 +143,8 @@ describe("AcpClient", () => {
       vi.useFakeTimers();
       try {
         const promise = client.newSession("/test");
-        // Advance past the 600s timeout
-        await vi.advanceTimersByTimeAsync(610_000);
+        // Advance past the 30min timeout
+        await vi.advanceTimersByTimeAsync(1_810_000);
         await expect(promise).rejects.toThrow("timeout");
       } finally {
         vi.useRealTimers();
@@ -234,6 +234,22 @@ describe("AcpClient", () => {
       });
       pushServerMessage({ jsonrpc: "2.0", id: 1, result: { sessions: [] } });
       await expect(promise).resolves.toEqual({ sessions: [] });
+    });
+
+    it("session/load - should send sessionId, cwd, and mcpServers", async () => {
+      const promise = client.loadSession("s1", "/project");
+      expect(receivedJson()[0]).toMatchObject({
+        method: "session/load",
+        params: { sessionId: "s1", cwd: "/project", mcpServers: [] },
+      });
+      pushServerMessage({
+        jsonrpc: "2.0", id: 1,
+        result: { models: { currentModelId: "mistral-large" }, modes: { currentModeId: "plan" } },
+      });
+      await expect(promise).resolves.toEqual({
+        models: { currentModelId: "mistral-large" },
+        modes: { currentModeId: "plan" },
+      });
     });
 
     it("_session/set_title - should send underscore-prefixed method with direct params", async () => {

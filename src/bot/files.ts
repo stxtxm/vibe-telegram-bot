@@ -172,5 +172,6 @@ export async function changeDirectory(
   }
 
   session.cwd = resolvedPath;
+  await sessionManager.saveCwd(resolvedPath);
   return resolvedPath;
 }

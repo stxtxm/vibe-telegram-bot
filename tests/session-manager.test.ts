@@ -13,6 +13,7 @@ import { SessionManager } from "../src/acp/session.js";
 function createMockClient() {
   return {
     newSession: vi.fn(),
+    loadSession: vi.fn(),
     setModel: vi.fn(),
     setMode: vi.fn(),
     setConfigOption: vi.fn(),
@@ -75,6 +76,40 @@ describe("SessionManager", () => {
     it("should throw on invalid response", async () => {
       client.newSession.mockResolvedValue({});
       await expect(sm.createSession("/project")).rejects.toThrow("Invalid response");
+    });
+  });
+
+  describe("loadSession", () => {
+    it("should call client.loadSession and update local state", async () => {
+      client.loadSession.mockResolvedValue({
+        models: { currentModelId: "mistral-large" },
+        modes: { currentModeId: "agent" },
+        configOptions: [{ id: "thinking", name: "Thinking", type: "select", currentValue: "high" }],
+      });
+
+      const sid = await sm.loadSession("ses-existing", "/project");
+
+      expect(client.loadSession).toHaveBeenCalledWith("ses-existing", "/project");
+      expect(sid).toBe("ses-existing");
+      expect(sm.currentSessionId).toBe("ses-existing");
+
+      const s = sm.getSession("ses-existing");
+      expect(s).toBeDefined();
+      expect(s!.id).toBe("ses-existing");
+      expect(s!.cwd).toBe("/project");
+      expect(s!.models!.currentModelId).toBe("mistral-large");
+      expect(s!.modes!.currentModeId).toBe("agent");
+    });
+
+    it("should handle null response gracefully", async () => {
+      client.loadSession.mockResolvedValue(null);
+
+      const sid = await sm.loadSession("ses-existing", "/project");
+
+      expect(sid).toBe("ses-existing");
+      const s = sm.getSession("ses-existing");
+      expect(s).toBeDefined();
+      expect(s!.models).toBeUndefined();
     });
   });
 
