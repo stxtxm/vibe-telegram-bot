@@ -115,6 +115,10 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
 
     // Cancel any running prompt and start fresh
     if (busy) {
+      // Send accumulated progress before canceling
+      if (progressText) {
+        ctx.reply(`📝 **Accumulé avant annulation:**\n\n${progressText.slice(0, 2000)}`).catch(() => {});
+      }
       if (pendingPermission) {
         logger.info(`[Permission] Auto-rejected id=${pendingPermission.id} (new prompt)`);
         if (permissionTimeout) { clearTimeout(permissionTimeout); permissionTimeout = null; }
@@ -129,7 +133,9 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     progressText = "";
     toolCallMap = new Map();
 
-    const statusMsg = await ctx.reply("⏳ Thinking...");
+    const statusMsg = await ctx.reply("⏳ Thinking...", {
+      reply_markup: new InlineKeyboard().text("Abort", `abort:${generation}`),
+    });
     progressChatId = statusMsg.chat.id;
     progressMessageId = statusMsg.message_id;
     const stopTyping = startTypingInterval(statusMsg.chat.id);
@@ -191,6 +197,18 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
         return;
       }
 
+      // Send accumulated progress before error message
+      if (progressText) {
+        for (const chunk of splitMessage(progressText.slice(0, 4000))) {
+          await replyWithFallback(ctx, `📝 **Progression avant erreur:**\n\n${chunk}`);
+        }
+      }
+
+      // Update status message to show error
+      if (progressChatId && progressMessageId) {
+        bot.api.editMessageText(progressChatId, progressMessageId, "❌ **Erreur**").catch(() => {});
+      }
+
       const stderr = acpClient.getRecentStderr?.() || "";
       if (stderr) logger.warn("[Bot] ACP stderr during error:\n" + stderr.slice(-1000));
 
@@ -241,6 +259,28 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     const data = ctx.callbackQuery.data;
     logger.info(`[Callback] data="${data}" user=${ctx.from?.id}`);
     const sid = sessionManager.currentSessionId;
+
+    // Abort prompt
+    if (data.startsWith("abort:")) {
+      const gen = parseInt(data.split(":")[1], 10);
+      if (busy && gen > 0 && gen <= promptGeneration) {
+        if (sid) acpClient.cancelPrompt(sid);
+        if (pendingPermission) {
+          if (permissionTimeout) { clearTimeout(permissionTimeout); permissionTimeout = null; }
+          acpClient.respondPermissionError(pendingPermission.id);
+          pendingPermission = null;
+        }
+        // Send accumulated progress before acknowledging abort
+        if (progressText) {
+          await ctx.reply(`📝 **Accumulé avant annulation:**\n\n${progressText.slice(0, 2000)}`);
+        }
+        await ctx.editMessageText("⏹️ Annulé").catch(() => {});
+        busy = false;
+      } else {
+        await ctx.editMessageText("✅ Déjà terminé").catch(() => {});
+      }
+      return;
+    }
 
     // Permission response
     if (data.startsWith("perm:")) {
@@ -383,7 +423,8 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
       lastFlushTime = now;
       if (progressChatId && progressMessageId && progressText) {
         const text = progressText.length > 4000 ? progressText.slice(0, 4000) + "..." : progressText;
-        bot.api.editMessageText(progressChatId, progressMessageId, `💬 ${text}`).catch(() => {});
+        const kb = new InlineKeyboard().text("Abort", `abort:${promptGeneration}`);
+        bot.api.editMessageText(progressChatId, progressMessageId, `💬 ${text}`, { reply_markup: kb }).catch(() => {});
       }
     }, (p) => {
       // Clear previous timeout
