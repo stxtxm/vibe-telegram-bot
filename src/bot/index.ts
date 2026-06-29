@@ -827,14 +827,14 @@ async function handleAcpNotification(
       }
       // Register permission BEFORE sending — ensures it's tracked even if Telegram API fails
       setPendingPermission({ id: m.id as number, sessionId: params.sessionId as string });
-      await bot.api.sendMessage(chatId,
-        `🔒 **${toolName}**${kindLabel}${inputStr}`,
-        { parse_mode: "Markdown", reply_markup: kb },
-      ).then(() => {
+      const permText = `🔒 **${toolName}**${kindLabel}${inputStr}`;
+      try {
+        await bot.api.sendMessage(chatId, permText, { parse_mode: "Markdown", reply_markup: kb });
         logger.info(`[Permission] Message sent for id=${m.id}`);
-      }).catch((err) => {
-        logger.error(`[Permission] Failed to send message for id=${m.id}:`, err);
-      });
+      } catch {
+        try { await bot.api.sendMessage(chatId, permText, { reply_markup: kb }); }
+        catch (e) { logger.error(`[Permission] Failed to send message for id=${m.id}:`, e); }
+      }
     }
     return;
   }
@@ -972,7 +972,7 @@ function formatToolInput(toolName: string, input: Record<string, unknown>): stri
     const cmd = input.command as string || input.code as string || "";
     if (cmd) return `\n\`\`\`bash\n$ ${cmd.slice(0, 1000)}\n\`\`\``;
   }
-  if (toolName === "read" || toolName === "write" || toolName === "edit") {
+  if (/^(read|write|write_file|edit)$/.test(toolName)) {
     if (fp) return `\n📄 \`${escapeMarkdown(fp.slice(0, 300))}\``;
   }
   if (toolName === "search" || toolName === "grep") {
