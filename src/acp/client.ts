@@ -9,7 +9,7 @@ import type { JsonRpcResponse, JsonRpcNotification } from "./protocol.js";
 type MessageHandler = (msg: JsonRpcResponse | JsonRpcNotification) => void;
 type DisconnectHandler = () => void;
 
-const REQUEST_TIMEOUT = 1_800_000; // 30 minutes
+const REQUEST_TIMEOUT = 0; // 0 = disabled (no timeout on ACP requests)
 
 function loadMistralKey(): string | undefined {
   try {
@@ -134,13 +134,15 @@ export class AcpClient {
       this.pending.set(id, { resolve, reject });
       this.proc?.stdin?.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
 
-      setTimeout(() => {
-        const cb = this.pending.get(id);
-        if (cb) {
-          this.pending.delete(id);
-          cb.reject(new Error(`ACP request timeout: ${method}`));
-        }
-      }, REQUEST_TIMEOUT);
+      if (REQUEST_TIMEOUT > 0) {
+        setTimeout(() => {
+          const cb = this.pending.get(id);
+          if (cb) {
+            this.pending.delete(id);
+            cb.reject(new Error(`ACP request timeout: ${method}`));
+          }
+        }, REQUEST_TIMEOUT);
+      }
     });
   }
 

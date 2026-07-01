@@ -139,16 +139,15 @@ describe("AcpClient", () => {
   });
 
   describe("timeout", () => {
-    it("should reject on timeout", async () => {
-      vi.useFakeTimers();
-      try {
-        const promise = client.newSession("/test");
-        // Advance past the 30min timeout
-        await vi.advanceTimersByTimeAsync(1_810_000);
-        await expect(promise).rejects.toThrow("timeout");
-      } finally {
-        vi.useRealTimers();
-      }
+    it("should not timeout when REQUEST_TIMEOUT is 0", async () => {
+      // The request should stay pending indefinitely
+      const promise = client.newSession("/test");
+      // Wait a brief moment to confirm it hasn't resolved/rejected
+      await new Promise((r) => setTimeout(r, 50));
+      expect(client["pending"].size).toBe(1);
+      // Resolve it normally
+      pushServerMessage({ jsonrpc: "2.0", id: 1, result: { sessionId: "s1" } });
+      await expect(promise).resolves.toEqual({ sessionId: "s1" });
     });
   });
 

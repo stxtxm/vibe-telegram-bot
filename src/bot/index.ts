@@ -7,7 +7,6 @@ import type { AcpClient } from "../acp/client.js";
 import { SessionManager, type SessionState } from "../acp/session.js";
 import { TodoManager } from "../todo.js";
 
-const PROMPT_TIMEOUT = 300_000; // 5 min
 const PROGRESS_FLUSH_INTERVAL = 1_000; // min ms between progress edits (rate limiting)
 const TOOL_EMOJI: Record<string, string> = {
   read: "📖", write: "✏️", edit: "🔧", bash: "💻",
