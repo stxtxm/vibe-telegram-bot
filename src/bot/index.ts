@@ -420,10 +420,14 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
       const now = Date.now();
       if (now - lastFlushTime < PROGRESS_FLUSH_INTERVAL) return;
       lastFlushTime = now;
-      if (progressChatId && progressMessageId && progressText) {
-        const text = progressText.length > 4000 ? progressText.slice(0, 4000) + "..." : progressText;
+      if (progressChatId && progressMessageId) {
+        const toolSummary = buildToolSummary(toolCallMap);
+        const statusLine = toolSummary ? `⚙️ ${toolSummary}` : "🤔 Thinking...";
+        const text = progressText.length > 2000 ? progressText.slice(0, 2000) + "..." : progressText;
+        const body = text ? `\n💬 ${text}` : "";
+        const full = statusLine + body;
         const kb = new InlineKeyboard().text("Abort", `abort:${promptGeneration}`);
-        bot.api.editMessageText(progressChatId, progressMessageId, `💬 ${text}`, { reply_markup: kb }).catch(() => {});
+        bot.api.editMessageText(progressChatId, progressMessageId, full, { reply_markup: kb }).catch(() => {});
       }
     }, (p) => {
       // Clear previous timeout
