@@ -95,10 +95,10 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     }
 
     if (streamMessageId !== null) {
-      await editWithMarkdown(chatId, streamMessageId, text);
+      await editWithHtml(chatId, streamMessageId, text);
     } else {
       const extra = originalUserMessageId ? { reply_to_message_id: originalUserMessageId } : {};
-      const msg = await replyWithMarkdown(chatId, text, extra);
+      const msg = await replyWithHtml(chatId, text, extra);
       streamMessageId = msg.message_id;
       streamChatId = chatId;
     }
@@ -126,17 +126,17 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     return flushResponseText(chatId, false);
   }
 
-  async function replyWithMarkdown(chatId: number, text: string, extra?: Record<string, unknown>): Promise<{ message_id: number }> {
+  async function replyWithHtml(chatId: number, text: string, extra?: Record<string, unknown>): Promise<{ message_id: number }> {
     try {
-      return await bot.api.sendMessage(chatId, text, { parse_mode: "Markdown", ...extra } as never);
+      return await bot.api.sendMessage(chatId, text, { parse_mode: "HTML", ...extra } as never);
     } catch {
       return await bot.api.sendMessage(chatId, text, extra as never);
     }
   }
 
-  async function editWithMarkdown(chatId: number, messageId: number, text: string, extra?: Record<string, unknown>): Promise<void> {
+  async function editWithHtml(chatId: number, messageId: number, text: string, extra?: Record<string, unknown>): Promise<void> {
     try {
-      await bot.api.editMessageText(chatId, messageId, text, { parse_mode: "Markdown", ...extra } as never);
+      await bot.api.editMessageText(chatId, messageId, text, { parse_mode: "HTML", ...extra } as never);
     } catch {
       try { await bot.api.editMessageText(chatId, messageId, text, extra as never); } catch { /* ignore */ }
     }
@@ -318,9 +318,10 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
       }
 
       // Phase 1a: flush final streamed text
-      if (streamChatId) {
-        cancelFlushTimeout();
-        await flushResponseText(streamChatId, true).catch(() => {});
+      cancelFlushTimeout();
+      const flushChatId = streamChatId || progressChatId || config.telegram.allowedUserId;
+      if (flushChatId) {
+        await flushResponseText(flushChatId, true).catch(() => {});
       }
 
       // Build tool summary and footer
