@@ -34,9 +34,7 @@ export class AcpClient {
 
   async start(): Promise<void> {
     logger.info("[ACP] Starting vibe-acp...");
-    const useWrapper = !process.env.VIBE_PATH;
-    const bin = useWrapper ? ".venv/bin/python3" : process.env.VIBE_PATH!;
-    const binArgs = useWrapper ? ["acp_wrapper.py"] : [];
+    const bin = process.env.VIBE_PATH || ".venv/bin/vibe-acp";
     const cwd = process.env.VIBE_CWD || process.cwd();
     const env: Record<string, string | undefined> = { ...process.env };
     if (!env.MISTRAL_API_KEY) {
@@ -44,7 +42,7 @@ export class AcpClient {
       if (key) env.MISTRAL_API_KEY = key;
     }
 
-    this.proc = spawn(bin, binArgs, { cwd, stdio: ["pipe", "pipe", "pipe"], env });
+    this.proc = spawn(bin, [], { cwd, stdio: ["pipe", "pipe", "pipe"], env });
 
     this.proc.on("error", (err) => {
       logger.error("[ACP] spawn error:", err.message);
