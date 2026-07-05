@@ -404,6 +404,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
         responseStreamer.abort();
         progressText = "";
         toolCallMap = new Map();
+        changedFiles.clear();
         await responseStreamer.start(generation, ctx.message.message_id);
         const backoff = 1000 * (1 + retry);
         await ctx.reply(`🔄 **Erreur API** (PoolTimeout). Nouvelle tentative dans ${backoff / 1000}s... (tentative ${retry + 1}/${MAX_PROMPT_RETRIES})`);
@@ -423,6 +424,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
           responseStreamer.abort();
           progressText = "";
           toolCallMap = new Map();
+          changedFiles.clear();
           await responseStreamer.start(generation, ctx.message.message_id);
           await ctx.reply(`🔄 Session rechargée. Je relance...`);
           recovered = true;
@@ -436,6 +438,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
           responseStreamer.abort();
           progressText = "";
           toolCallMap = new Map();
+          changedFiles.clear();
           await responseStreamer.start(generation, ctx.message.message_id);
           await ctx.reply(`🔄 Nouvelle session créée. Je relance...`);
           recovered = true;
