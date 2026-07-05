@@ -721,6 +721,8 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
       responseStreamer.setUsage(usage);
       keyboardManager.updateUsage(usage.inputTokens, usage.outputTokens, usage.cost);
       keyboardManager.refreshKeyboard();
+    }, (summary) => {
+      responseStreamer.setToolSummary(summary);
     }).catch((err) => {
       logger.error("[Bot] notification error:", err);
     });
@@ -1127,6 +1129,7 @@ async function handleAcpNotification(
   onTextChunk?: (text: string) => void,
   onThinkingChunk?: (text: string) => void,
   onUsage?: (usage: { inputTokens: number; outputTokens: number; cost: number }) => void,
+  onToolUpdate?: (summary: string) => void,
 ): Promise<void> {
   const m = msg as Record<string, unknown>;
   const method = m.method as string | undefined;
@@ -1231,6 +1234,10 @@ async function handleAcpNotification(
         toolCountWrapper.n++;
       }
       flushProgress();
+      if (onToolUpdate) {
+        const summary = buildToolSummary(toolCallMap);
+        onToolUpdate(summary);
+      }
       return;
     }
 

@@ -17,6 +17,7 @@ interface StreamState {
   accumulatedText: string;
   thinkingText: string;
   hasShownThinking: boolean;
+  toolSummaryText: string;
   lastSentSignature: string | null;
   flushTimer: ReturnType<typeof setTimeout> | null;
   lastFlushTime: number;
@@ -42,6 +43,7 @@ export class ResponseStreamer {
       accumulatedText: "",
       thinkingText: "",
       hasShownThinking: false,
+      toolSummaryText: "",
       lastSentSignature: null,
       flushTimer: null,
       lastFlushTime: 0,
@@ -102,6 +104,13 @@ export class ResponseStreamer {
   setUsage(usage: UsageData): void {
     if (!this.state?.isActive) return;
     this.state.usage = usage;
+  }
+
+  setToolSummary(text: string): void {
+    if (!this.state?.isActive) return;
+    if (this.state.toolSummaryText === text) return;
+    this.state.toolSummaryText = text;
+    this.scheduleFlush(false);
   }
 
   private scheduleFlush(isFinal: boolean): void {
@@ -197,11 +206,14 @@ export class ResponseStreamer {
 
   private buildCombinedText(): string {
     if (!this.state) return "";
-    const { hasShownThinking, thinkingText, accumulatedText } = this.state;
+    const { hasShownThinking, thinkingText, toolSummaryText, accumulatedText } = this.state;
     let text = "";
     if (hasShownThinking && thinkingText) {
       const escaped = this.escapeHtml(thinkingText);
       text += `<blockquote>${escaped}</blockquote>\n\n`;
+    }
+    if (toolSummaryText) {
+      text += `${toolSummaryText}\n\n`;
     }
     if (accumulatedText) {
       text += this.escapeHtml(accumulatedText);
