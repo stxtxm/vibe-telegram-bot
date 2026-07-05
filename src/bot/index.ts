@@ -404,6 +404,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
         responseStreamer.abort();
         progressText = "";
         toolCallMap = new Map();
+        await responseStreamer.start(generation, ctx.message.message_id);
         const backoff = 1000 * (1 + retry);
         await ctx.reply(`🔄 **Erreur API** (PoolTimeout). Nouvelle tentative dans ${backoff / 1000}s... (tentative ${retry + 1}/${MAX_PROMPT_RETRIES})`);
         await new Promise(r => setTimeout(r, backoff));
@@ -417,9 +418,12 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
         const lastCwd = sessionManager.current?.cwd || config.vibe.projectDir;
         try {
           await sessionManager.loadSession(sid, lastCwd);
+          // The loadSession may replay old agent_message_chunk notifications into
+          // the streamer — kill the stale stream and start fresh for the retry
           responseStreamer.abort();
           progressText = "";
           toolCallMap = new Map();
+          await responseStreamer.start(generation, ctx.message.message_id);
           await ctx.reply(`🔄 Session rechargée. Je relance...`);
           recovered = true;
           await runPrompt(acpClient, ctx, sid, generation, stopTyping, retry + 1);
@@ -432,6 +436,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
           responseStreamer.abort();
           progressText = "";
           toolCallMap = new Map();
+          await responseStreamer.start(generation, ctx.message.message_id);
           await ctx.reply(`🔄 Nouvelle session créée. Je relance...`);
           recovered = true;
           await runPrompt(acpClient, ctx, newSid, generation, stopTyping, retry + 1);
