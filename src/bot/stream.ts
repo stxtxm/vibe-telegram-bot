@@ -136,7 +136,10 @@ export class ResponseStreamer {
     const text = this.buildCombinedText();
     if (!text && !isFinal) return;
 
-    const sig = this.signature(text);
+    // Truncate for editMessageText (Telegram 4096 limit)
+    const displayText = text.length > TEXT_LIMIT ? text.slice(0, TEXT_LIMIT) + "…" : text;
+
+    const sig = this.signature(displayText);
     if (!isFinal && sig === s.lastSentSignature) return;
 
     const now = Date.now();
@@ -151,7 +154,7 @@ export class ResponseStreamer {
 
     if (msgId !== null) {
       try {
-        await this.bot.api.editMessageText(chatId, msgId, text || "⏳ Thinking...", { parse_mode: "HTML" } as never);
+        await this.bot.api.editMessageText(chatId, msgId, displayText || "⏳ Thinking...", { parse_mode: "HTML" } as never);
         s.lastSentSignature = sig;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -160,26 +163,28 @@ export class ResponseStreamer {
         }
         if (msg.includes("message to edit not found") || msg.includes("message not found")) {
           s.streamMessageId = null;
-          await this.sendFreshMessage(text, s);
+          await this.sendFreshMessage(displayText, s);
           return;
         }
         logger.warn("[Stream] editMessageText error:", msg);
       }
     } else {
-      await this.sendFreshMessage(text, s);
+      await this.sendFreshMessage(displayText, s);
     }
   }
 
   private async sendFreshMessage(text: string, s: StreamState): Promise<void> {
+    // Also cap fresh messages to TEXT_LIMIT
+    const displayText = text.length > TEXT_LIMIT ? text.slice(0, TEXT_LIMIT) + "…" : text;
     try {
-      const msg = await this.bot.api.sendMessage(s.chatId, text || "⏳ Thinking...", { parse_mode: "HTML" } as never);
+      const msg = await this.bot.api.sendMessage(s.chatId, displayText || "⏳ Thinking...", { parse_mode: "HTML" } as never);
       s.streamMessageId = msg.message_id;
-      s.lastSentSignature = this.signature(text);
+      s.lastSentSignature = this.signature(displayText);
     } catch (err) {
       try {
-        const msg = await this.bot.api.sendMessage(s.chatId, text || "⏳ Thinking...");
+        const msg = await this.bot.api.sendMessage(s.chatId, displayText || "⏳ Thinking...");
         s.streamMessageId = msg.message_id;
-        s.lastSentSignature = this.signature(text);
+        s.lastSentSignature = this.signature(displayText);
       } catch (e2) {
         logger.warn("[Stream] Failed to send fresh message:", e2);
       }
@@ -221,10 +226,28 @@ export class ResponseStreamer {
     this.cancelTimer();
     await this.flushState(true);
 
+    // If response was truncated, send the full text as a separate message
+    const rawLen = (s.accumulatedText || "").length;
+    if (rawLen > TEXT_LIMIT) {
+      this.sendFullResponse(s).catch(() => {});
+    }
+
     // Append footer to the stream message (keep the response text visible)
     await this.appendFooter(toolSummary, duration);
 
     this.cleanup();
+  }
+
+  private async sendFullResponse(s: StreamState): Promise<void> {
+    const chunks = splitMessage(s.accumulatedText, TEXT_LIMIT);
+    for (const chunk of chunks) {
+      const escaped = this.escapeHtml(chunk);
+      try {
+        await this.bot.api.sendMessage(s.chatId, escaped, { parse_mode: "HTML" } as never);
+      } catch {
+        try { await this.bot.api.sendMessage(s.chatId, chunk); } catch { /* ignore */ }
+      }
+    }
   }
 
   private async appendFooter(toolSummary: string, duration: string): Promise<void> {
@@ -245,16 +268,19 @@ export class ResponseStreamer {
     }
 
     if (s.streamMessageId) {
-      // Try to append footer below the existing response text
       const existing = this.buildCombinedText();
       if (existing) {
-        const updated = existing + `\n\n━━━━━━━━━━━━━━━━━━\n${footer}`;
-        try {
-          await this.bot.api.editMessageText(s.chatId, s.streamMessageId, updated, { parse_mode: "HTML" } as never);
-          s.streamMessageId = null;
-          return;
-        } catch {
-          // Fall through to send separate message
+        const sep = `\n\n━━━━━━━━━━━━━━━━━━\n`;
+        const updated = existing + sep + footer;
+        // Only edit if it fits within limit
+        if (updated.length <= TEXT_LIMIT) {
+          try {
+            await this.bot.api.editMessageText(s.chatId, s.streamMessageId, updated, { parse_mode: "HTML" } as never);
+            s.streamMessageId = null;
+            return;
+          } catch {
+            // Fall through to send separate footer message
+          }
         }
       }
     }
