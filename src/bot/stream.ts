@@ -307,13 +307,39 @@ export class ResponseStreamer {
             s.streamMessageId = null;
             return;
           } catch {
-            // Fall through to send separate footer message
+            // Fall through to send separate message
           }
         }
       }
     }
 
-    // Fallback: send footer as a new message
+    // Fallback: send the actual response text + footer as a new message
+    const body = this.buildCombinedText();
+    if (body) {
+      const sep = `\n\n━━━━━━━━━━━━━━━━━━\n`;
+      const payload = body + sep + footer;
+      if (payload.length <= TEXT_LIMIT) {
+        try {
+          await this.bot.api.sendMessage(s.chatId, payload, { parse_mode: "HTML" } as never);
+          return;
+        } catch {
+          // try plain text
+        }
+        try {
+          await this.bot.api.sendMessage(s.chatId, s.accumulatedText || "✅ Done");
+          return;
+        } catch { /* ignore */ }
+      } else {
+        // Too long — send truncated HTML version
+        const truncated = this.truncateHtml(body, TEXT_LIMIT - sep.length - footer.length - 3) + sep + footer;
+        try {
+          await this.bot.api.sendMessage(s.chatId, truncated, { parse_mode: "HTML" } as never);
+          return;
+        } catch { /* ignore */ }
+      }
+    }
+
+    // Absolute fallback: just the footer
     try {
       const fallbackText = `✅ **Done**\n${footer}`;
       await this.bot.api.sendMessage(s.chatId, fallbackText, { parse_mode: "Markdown" } as never);
