@@ -1,0 +1,319 @@
+import { type Bot, type Context, InlineKeyboard } from "grammy";
+import { logger } from "../utils/logger.js";
+
+const THROTTLE_MS = 1_000;
+const TEXT_LIMIT = 3_800;
+
+interface UsageData {
+  inputTokens: number;
+  outputTokens: number;
+  cost: number;
+}
+
+interface StreamState {
+  chatId: number;
+  generation: number;
+  streamMessageId: number | null;
+  accumulatedText: string;
+  thinkingText: string;
+  hasShownThinking: boolean;
+  lastSentSignature: string | null;
+  flushTimer: ReturnType<typeof setTimeout> | null;
+  lastFlushTime: number;
+  usage: UsageData | null;
+  isActive: boolean;
+}
+
+export class ResponseStreamer {
+  private bot: Bot<Context>;
+  private chatId: number;
+  private state: StreamState | null = null;
+
+  constructor(bot: Bot<Context>, chatId: number) {
+    this.bot = bot;
+    this.chatId = chatId;
+  }
+
+  start(generation: number, replyToMessageId?: number): Promise<number> {
+    this.state = {
+      chatId: this.chatId,
+      generation,
+      streamMessageId: null,
+      accumulatedText: "",
+      thinkingText: "",
+      hasShownThinking: false,
+      lastSentSignature: null,
+      flushTimer: null,
+      lastFlushTime: 0,
+      usage: null,
+      isActive: true,
+    };
+
+    const abortKb = new InlineKeyboard().text("Abort", `abort:${generation}`);
+    const extra: Record<string, unknown> = { reply_markup: abortKb };
+    if (replyToMessageId) {
+      extra.reply_to_message_id = replyToMessageId;
+    }
+
+    return this.sendInitialMessage(extra);
+  }
+
+  private async sendInitialMessage(extra: Record<string, unknown>): Promise<number> {
+    try {
+      const msg = await this.bot.api.sendMessage(this.chatId, "⏳ Thinking...", extra as never);
+      if (this.state) this.state.streamMessageId = msg.message_id;
+      return msg.message_id;
+    } catch (err) {
+      logger.warn("[Stream] Failed to send initial message:", err);
+      return 0;
+    }
+  }
+
+  get streamMessageId(): number | null {
+    return this.state?.streamMessageId ?? null;
+  }
+
+  get isActive(): boolean {
+    return this.state?.isActive ?? false;
+  }
+
+  get generation(): number {
+    return this.state?.generation ?? 0;
+  }
+
+  get usage(): UsageData | null {
+    return this.state?.usage ?? null;
+  }
+
+  appendResponse(text: string): void {
+    if (!this.state?.isActive) return;
+    this.state.accumulatedText += text;
+    this.scheduleFlush(false);
+  }
+
+  appendThinking(text: string): void {
+    if (!this.state?.isActive) return;
+    this.state.thinkingText += text;
+    this.state.hasShownThinking = true;
+    this.scheduleFlush(false);
+  }
+
+  setUsage(usage: UsageData): void {
+    if (!this.state?.isActive) return;
+    this.state.usage = usage;
+  }
+
+  private scheduleFlush(isFinal: boolean): void {
+    if (!this.state) return;
+    if (this.state.flushTimer) {
+      clearTimeout(this.state.flushTimer);
+      this.state.flushTimer = null;
+    }
+    if (isFinal) {
+      this.flushState(true).catch(() => {});
+    } else {
+      this.state.flushTimer = setTimeout(() => {
+        if (this.state?.isActive) {
+          this.flushState(false).catch(() => {});
+        }
+      }, THROTTLE_MS);
+    }
+  }
+
+  flushNow(): Promise<void> {
+    if (!this.state) return Promise.resolve();
+    if (this.state.flushTimer) {
+      clearTimeout(this.state.flushTimer);
+      this.state.flushTimer = null;
+    }
+    return this.flushState(false);
+  }
+
+  private async flushState(isFinal: boolean): Promise<void> {
+    const s = this.state;
+    if (!s || !s.isActive) return;
+
+    const text = this.buildCombinedText();
+    if (!text && !isFinal) return;
+
+    const sig = this.signature(text);
+    if (!isFinal && sig === s.lastSentSignature) return;
+
+    const now = Date.now();
+    if (!isFinal && now - s.lastFlushTime < THROTTLE_MS) {
+      this.scheduleFlush(false);
+      return;
+    }
+    s.lastFlushTime = now;
+
+    const chatId = s.chatId;
+    const msgId = s.streamMessageId;
+
+    if (msgId !== null) {
+      try {
+        await this.bot.api.editMessageText(chatId, msgId, text || "⏳ Thinking...", { parse_mode: "HTML" } as never);
+        s.lastSentSignature = sig;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes("message is not modified")) {
+          return;
+        }
+        if (msg.includes("message to edit not found") || msg.includes("message not found")) {
+          s.streamMessageId = null;
+          await this.sendFreshMessage(text, s);
+          return;
+        }
+        logger.warn("[Stream] editMessageText error:", msg);
+      }
+    } else {
+      await this.sendFreshMessage(text, s);
+    }
+  }
+
+  private async sendFreshMessage(text: string, s: StreamState): Promise<void> {
+    try {
+      const msg = await this.bot.api.sendMessage(s.chatId, text || "⏳ Thinking...", { parse_mode: "HTML" } as never);
+      s.streamMessageId = msg.message_id;
+      s.lastSentSignature = this.signature(text);
+    } catch (err) {
+      try {
+        const msg = await this.bot.api.sendMessage(s.chatId, text || "⏳ Thinking...");
+        s.streamMessageId = msg.message_id;
+        s.lastSentSignature = this.signature(text);
+      } catch (e2) {
+        logger.warn("[Stream] Failed to send fresh message:", e2);
+      }
+    }
+  }
+
+  private buildCombinedText(): string {
+    if (!this.state) return "";
+    const { hasShownThinking, thinkingText, accumulatedText } = this.state;
+    let text = "";
+    if (hasShownThinking && thinkingText) {
+      const escaped = this.escapeHtml(thinkingText);
+      text += `<blockquote>${escaped}</blockquote>\n\n`;
+    }
+    if (accumulatedText) {
+      text += accumulatedText;
+    }
+    return text;
+  }
+
+  private signature(text: string): string {
+    let hash = 0;
+    for (let i = 0; i < text.length; i++) {
+      const char = text.charCodeAt(i);
+      hash = ((hash << 5) - hash) + char;
+      hash = hash & hash;
+    }
+    return hash.toString(36);
+  }
+
+  private escapeHtml(text: string): string {
+    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
+  async finalize(toolSummary: string, duration: string): Promise<void> {
+    const s = this.state;
+    if (!s) return;
+
+    this.cancelTimer();
+    await this.flushState(true);
+
+    // Edit progress message to done
+    if (s.streamMessageId) {
+      const doneLine = toolSummary ? `✅ **Done** — ${toolSummary}` : "✅ **Done**";
+      try {
+        await this.bot.api.editMessageText(s.chatId, s.streamMessageId, doneLine, { parse_mode: "Markdown" } as never);
+        s.streamMessageId = null;
+      } catch {
+        // ignore
+      }
+    }
+
+    // Send footer
+    await this.sendFooter(toolSummary, duration);
+
+    this.cleanup();
+  }
+
+  private async sendFooter(toolSummary: string, duration: string): Promise<void> {
+    const s = this.state;
+    if (!s) return;
+
+    let footer = "";
+    if (s.usage) {
+      footer = `⏱️ ${duration}  🤖 ${s.usage.inputTokens}→${s.usage.outputTokens} tok`;
+      if (s.usage.cost > 0) {
+        footer += `  💰 $${s.usage.cost.toFixed(4)}`;
+      }
+    } else {
+      footer = `⏱️ ${duration}`;
+    }
+    if (toolSummary) {
+      footer = `⚙️ ${toolSummary}\n` + footer;
+    }
+
+    try {
+      await this.bot.api.sendMessage(s.chatId, footer, { parse_mode: "Markdown" } as never);
+    } catch {
+      try { await this.bot.api.sendMessage(s.chatId, footer); } catch { /* ignore */ }
+    }
+  }
+
+  cancelWithAccumulated(): Promise<void> {
+    return this.finalize("", "");
+  }
+
+  abort(): void {
+    const s = this.state;
+    if (!s) return;
+    this.cancelTimer();
+    this.cleanup();
+  }
+
+  private cancelTimer(): void {
+    if (this.state?.flushTimer) {
+      clearTimeout(this.state.flushTimer);
+      this.state.flushTimer = null;
+    }
+  }
+
+  private cleanup(): void {
+    if (this.state) {
+      this.state.isActive = false;
+      this.state.streamMessageId = null;
+    }
+  }
+}
+
+export function splitMessage(text: string, max = 4096): string[] {
+  if (text.length <= max) return [text];
+  const out: string[] = [];
+  let start = 0;
+  while (start < text.length) {
+    if (start + max >= text.length) {
+      out.push(text.slice(start));
+      break;
+    }
+    const end = start + max;
+    const nl = text.lastIndexOf("\n", end);
+    if (nl > start) {
+      out.push(text.slice(start, nl + 1));
+      start = nl + 1;
+    } else {
+      out.push(text.slice(start, end));
+      start = end;
+    }
+  }
+  return out;
+}
+
+export function escapeHtml(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+export function escapeMarkdown(text: string): string {
+  return text.replace(/([_*\[\]()~`>#+\-=|{}.!])/g, "\\$1");
+}

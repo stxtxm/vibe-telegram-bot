@@ -42,7 +42,7 @@ export class AcpClient {
       if (key) env.MISTRAL_API_KEY = key;
     }
 
-    this.proc = spawn(bin, [], { cwd, stdio: ["pipe", "pipe", "pipe"], env });
+    this.proc = spawn(bin, [], { cwd, stdio: ["pipe", "pipe", "pipe"], env, detached: true });
 
     this.proc.on("error", (err) => {
       logger.error("[ACP] spawn error:", err.message);

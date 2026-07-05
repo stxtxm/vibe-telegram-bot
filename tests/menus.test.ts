@@ -4,17 +4,20 @@ import {
   buildModeMenu,
   buildThinkingMenu,
   buildSessionList,
+  buildQuestionMenu,
   isModelSelect,
   isModeSelect,
   isThinkingSelect,
   isSessionSelect,
   isSessionPage,
   isMenuCancel,
+  isQuestionSelect,
   parseModelData,
   parseModeData,
   parseThinkingData,
   parseSessionSelect,
   parseSessionPage,
+  parseQuestionData,
 } from "../src/bot/menus.js";
 import type { ACPModel, ACPMode, ACPSessionInfo } from "../src/acp/protocol.js";
 
@@ -151,5 +154,30 @@ describe("buildSessionList", () => {
     }));
     const menu = buildSessionList(manySessions, 0);
     expect(menu.text).toContain("page 1/3");
+  });
+});
+
+describe("Question menu", () => {
+  it("should build question menu with options", () => {
+    const menu = buildQuestionMenu(0, "What color?", ["Red", "Blue", "Green"]);
+    expect(menu.text).toContain("What color?");
+    expect(menu.keyboard).toBeDefined();
+  });
+
+  it("should handle empty options", () => {
+    const menu = buildQuestionMenu(0, "Empty?", []);
+    expect(menu.text).toContain("Empty?");
+    expect(menu.keyboard).toBeDefined();
+  });
+
+  it("should parse question callback", () => {
+    const result = parseQuestionData("question:1:2");
+    expect(result.questionIndex).toBe(1);
+    expect(result.optionIndex).toBe(2);
+  });
+
+  it("should detect question callback", () => {
+    expect(isQuestionSelect("question:0:0")).toBe(true);
+    expect(isQuestionSelect("model:x")).toBe(false);
   });
 });

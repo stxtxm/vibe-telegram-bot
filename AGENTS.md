@@ -152,7 +152,12 @@ cp .env.example .env
 # Install Vibe CLI (if not already installed)
 curl -LsSf https://mistral.ai/vibe/install.sh | bash
 vibe --setup
+
+# Systemd service (optional but recommended for production)
+# Create /etc/systemd/system/vibe-telegram-bot.service with KillMode=mixed
+# (never use the default killMode=control-group — it can interfere with other services)
 ```
+
 
 ### Coding Guidelines
 

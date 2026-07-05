@@ -11,12 +11,17 @@ export function isThinkingSelect(data: string): boolean { return data.startsWith
 export function isSessionSelect(data: string): boolean { return data.startsWith("ses:"); }
 export function isSessionPage(data: string): boolean { return data.startsWith("sespage:"); }
 export function isMenuCancel(data: string): boolean { return data === "cancel"; }
+export function isQuestionSelect(data: string): boolean { return data.startsWith("question:"); }
 
 export function parseModelData(data: string): string { return data.slice(6); }
 export function parseModeData(data: string): string { return data.slice(5); }
 export function parseThinkingData(data: string): string { return data.slice(6); }
 export function parseSessionSelect(data: string): string { return data.slice(4); }
 export function parseSessionPage(data: string): number { return parseInt(data.slice(8), 10); }
+export function parseQuestionData(data: string): { questionIndex: number; optionIndex: number } {
+  const parts = data.slice(9).split(":");
+  return { questionIndex: parseInt(parts[0], 10), optionIndex: parseInt(parts[1], 10) };
+}
 
 // === MODEL MENU ===
 
@@ -100,4 +105,20 @@ export function buildSessionList(sessions: ACPSessionInfo[], page: number): { te
     text: `📁 **Sessions** (page ${page + 1}/${Math.ceil(sessions.length / PAGE_SIZE) || 1}):`,
     keyboard: kb,
   };
+}
+
+export function buildQuestionMenu(questionIndex: number, questionText: string, options: string[]): { text: string; keyboard: InlineKeyboard } {
+  const kb = new InlineKeyboard();
+  for (let i = 0; i < options.length; i++) {
+    kb.text(options[i], `question:${questionIndex}:${i}`).row();
+  }
+  kb.text("❌ Cancel", "cancel");
+  return {
+    text: `❓ **${escapeMenuText(questionText)}**`,
+    keyboard: kb,
+  };
+}
+
+function escapeMenuText(text: string): string {
+  return text.replace(/([_*\[\]()~`>#+\-=|{}.!])/g, "\\$1");
 }

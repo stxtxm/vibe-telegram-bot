@@ -25,10 +25,12 @@ const TOOL_EMOJI: Record<string, string> = {
   todoread: "📋", todowrite: "📝", apply_patch: "🩹",
 };
 import {
-  buildModelMenu, buildModeMenu, buildThinkingMenu, buildSessionList,
-  isModelSelect, isModeSelect, isThinkingSelect, isSessionSelect, isSessionPage, isMenuCancel, isFileAction,
-  parseModelData, parseModeData, parseThinkingData, parseSessionSelect, parseSessionPage,
+  buildModelMenu, buildModeMenu, buildThinkingMenu, buildSessionList, buildQuestionMenu,
+  isModelSelect, isModeSelect, isThinkingSelect, isSessionSelect, isSessionPage, isMenuCancel, isFileAction, isQuestionSelect,
+  parseModelData, parseModeData, parseThinkingData, parseSessionSelect, parseSessionPage, parseQuestionData,
 } from "./menus.js";
+import { KeyboardManager } from "./keyboard.js";
+import { ResponseStreamer } from "./stream.js";
 import {
   parseFileAction,
   buildFileMenu,
@@ -48,27 +50,25 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
   let toolCallMap = new Map<string, { name: string; kind: string; input?: Record<string, unknown> }>();
   let promptGeneration = 0;
 
-  // Streaming state (Phase 1a: real-time text)
-  let streamChatId: number | null = null;
-  let streamMessageId: number | null = null;
-  let accumulatedResponse = "";
-  let responseFlushTimeout: ReturnType<typeof setTimeout> | null = null;
-
-  // Thinking/reasoning state (Phase 1b)
-  let thinkingText = "";
-  let thinkingMessageId: number | null = null;
-  let hasShownThinking = false;
-  let thoughtLines = 0;
-
-  // Session footer state (Phase 2)
+  // Streaming state (Phase 1a/1b/2) — managed by ResponseStreamer
+  const responseStreamer = new ResponseStreamer(bot, config.telegram.allowedUserId);
   let promptStartTime = 0;
-  let lastUsage: { inputTokens: number; outputTokens: number; cost: number } | null = null;
 
   // Original user message ID (for replying to)
   let originalUserMessageId: number | null = null;
 
   // Pinned status message (Phase 3a)
   let pinnedMessageId: number | null = null;
+
+  // Tool call tracking for pinned message (mutable references for handleAcpNotification)
+  const changedFiles = new Set<string>();
+  const toolCountWrapper = { n: 0 };
+
+  // Active question state
+  let activeQuestion: { sessionId: string; questionIndex: number; options: string[]; messageId: number | null } | null = null;
+
+  // Pending file upload state
+  let pendingUpload: string | null = null;
 
   // Permission state
   let pendingPermission: { id: number; sessionId: string } | null = null;
@@ -80,50 +80,6 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     }, 4000);
     bot.api.sendChatAction(chatId, "typing").catch(() => {});
     return () => clearInterval(interval);
-  }
-
-  async function flushResponseText(chatId: number, isFinal: boolean): Promise<void> {
-    if (!accumulatedResponse && !thinkingText && !isFinal) return;
-    let text = "";
-    if (hasShownThinking && thinkingText) {
-      text = `<blockquote>${escapeHtml(thinkingText)}</blockquote>\n\n`;
-    }
-    text += accumulatedResponse;
-
-    if (!text) {
-      text = "⏳ Thinking…";
-    }
-
-    if (streamMessageId !== null) {
-      await editWithHtml(chatId, streamMessageId, text);
-    } else {
-      const extra = originalUserMessageId ? { reply_to_message_id: originalUserMessageId } : {};
-      const msg = await replyWithHtml(chatId, text, extra);
-      streamMessageId = msg.message_id;
-      streamChatId = chatId;
-    }
-  }
-
-  function cancelFlushTimeout(): void {
-    if (responseFlushTimeout) {
-      clearTimeout(responseFlushTimeout);
-      responseFlushTimeout = null;
-    }
-  }
-
-  function scheduleFlushResponse(chatId: number): void {
-    cancelFlushTimeout();
-    responseFlushTimeout = setTimeout(() => {
-      responseFlushTimeout = null;
-      if (promptGeneration !== 0) {
-        flushResponseText(chatId, false).catch(() => {});
-      }
-    }, 1500);
-  }
-
-  function flushResponseImmediate(chatId: number): Promise<void> {
-    cancelFlushTimeout();
-    return flushResponseText(chatId, false);
   }
 
   async function replyWithHtml(chatId: number, text: string, extra?: Record<string, unknown>): Promise<{ message_id: number }> {
@@ -148,20 +104,38 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     if (!sid) return;
     const session = sessionManager.getSession(sid);
     if (!session) return;
+    keyboardManager.updateCwd(session.cwd || config.vibe.projectDir);
+    keyboardManager.updateModel(session.models?.currentModelId || "?");
+    keyboardManager.updateMode(session.modes?.currentModeId || "?");
 
     const model = session.models?.currentModelId || "?";
     const mode = session.modes?.currentModeId || "?";
     const cwd = session.cwd || "?";
     const title = session.title || sid.slice(0, 8);
     const busyIcon = busy ? "🔴" : "🟢";
+    const thinking = session.configOptions?.find((o) => o.id === "thinking")?.currentValue || "?";
+    const usage = responseStreamer.usage;
 
-    const lines = [
+    const lines: string[] = [
       `📌 **Session** — ${escapeMarkdown(title)}`,
-      `🆔 \`${escapeMarkdown(sid.slice(0, 12))}…\``,
-      `🎯 Model: \`${escapeMarkdown(model)}\`  ⚙️ Mode: \`${escapeMarkdown(mode)}\``,
+      `🎯 Model: \`${escapeMarkdown(model)}\`  ⚙️ Mode: \`${escapeMarkdown(mode)}\`  💭 \`${thinking}\``,
       `📍 \`${escapeMarkdown(cwd)}\``,
-      `${busyIcon} ${busy ? "Busy…" : "Idle"}`,
     ];
+
+    if (usage && (usage.inputTokens > 0 || usage.outputTokens > 0)) {
+      lines.push(`📊 ${usage.inputTokens}→${usage.outputTokens} tok${usage.cost > 0 ? `  💰 $${usage.cost.toFixed(4)}` : ""}`);
+    }
+
+    if (toolCountWrapper.n > 0) {
+      let info = `🛠️ ${toolCountWrapper.n} tool${toolCountWrapper.n !== 1 ? "s" : ""}`;
+      if (changedFiles.size > 0) {
+        info += `  📄 ${changedFiles.size} file${changedFiles.size !== 1 ? "s" : ""}`;
+      }
+      lines.push(info);
+    }
+
+    lines.push(`${busyIcon} ${busy ? "Busy…" : "Idle"}`);
+
     const text = lines.join("\n");
 
     if (pinnedMessageId !== null) {
@@ -184,11 +158,10 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
   }
 
   // Persistent reply keyboard (Phase 3c)
-  const homeKeyboard = new Keyboard()
-    .text("/sessions").text("/model").text("/mode").row()
-    .text("/thinking").text("/pwd").text("/files").row()
-    .text("/help")
-    .resized();
+  const keyboardManager = new KeyboardManager(bot, config.telegram.allowedUserId);
+  function getKeyboard(): Keyboard {
+    return keyboardManager.getKeyboard();
+  }
 
   // === AUTH MIDDLEWARE ===
   bot.use(async (ctx, next) => {
@@ -281,16 +254,13 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     busy = true;
     progressText = "";
     toolCallMap = new Map();
-    accumulatedResponse = "";
-    streamMessageId = null;
-    thinkingText = "";
-    hasShownThinking = false;
-    thoughtLines = 0;
-    originalUserMessageId = ctx.message.message_id;
+    changedFiles.clear();
+    toolCountWrapper.n = 0;
     promptStartTime = Date.now();
-    lastUsage = null;
-    cancelFlushTimeout();
     updatePinnedMessage();
+
+    // Start response streamer
+    await responseStreamer.start(generation, ctx.message.message_id);
 
     const statusMsg = await ctx.reply("⏳ Thinking...", {
       reply_markup: new InlineKeyboard().text("Abort", `abort:${generation}`),
@@ -304,12 +274,60 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     });
   });
 
+  // === FILE UPLOAD HANDLER ===
+  bot.on("message:document", async (ctx) => {
+    const sid = sessionManager.currentSessionId;
+    if (!sid) { await ctx.reply("No session. Use /start."); return; }
+
+    const file = ctx.message.document;
+    const fileName = file.file_name || `document_${Date.now()}`;
+    const fileSize = file.file_size || 0;
+
+    // Max 20MB
+    if (fileSize > 20 * 1024 * 1024) {
+      await ctx.reply("❌ Fichier trop volumineux (max 20MB)");
+      return;
+    }
+
+    try {
+      const fileInfo = await bot.api.getFile(file.file_id);
+      if (!fileInfo.file_path) {
+        await ctx.reply("❌ Impossible de récupérer le fichier");
+        return;
+      }
+
+      const url = `https://api.telegram.org/file/bot${config.telegram.token}/${fileInfo.file_path}`;
+      const ext = fileName.includes(".") ? "" : ".bin";
+      const destPath = join(process.cwd(), "data", "uploads", `${Date.now()}_${fileName}${ext}`);
+      await fs.mkdir(dirname(destPath), { recursive: true });
+
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const buffer = Buffer.from(await response.arrayBuffer());
+      await fs.writeFile(destPath, buffer);
+
+      pendingUpload = destPath;
+      await ctx.reply(
+        `📄 Fichier reçu : \`${escapeMarkdown(fileName)}\` (${formatFileSizeStatic(fileSize)})\n📍 Sauvegardé dans le projet.\n📝 Envoie maintenant un message pour dire à Vibe quoi en faire.`,
+        { parse_mode: "Markdown" },
+      );
+    } catch (err) {
+      logger.error("[Upload] Failed:", err);
+      await ctx.reply(`❌ Erreur lors du téléchargement: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
+
   async function runPrompt(acpClient: AcpClient, ctx: Context, sid: string, generation: number, stopTyping?: () => void, retry = 0) {
     const text = ctx.message?.text;
     if (!text) return;
+    let effectiveText = text;
+    if (pendingUpload) {
+      effectiveText = `[File uploaded to ${pendingUpload}]\n\n${text}`;
+      pendingUpload = null;
+    }
     let recovered = false;
     try {
-      const result = await acpClient.sendPrompt(sid, text) as Record<string, unknown> | undefined;
+      const result = await acpClient.sendPrompt(sid, effectiveText) as Record<string, unknown> | undefined;
 
       // Stale — a newer prompt has superseded this one
       if (generation < promptGeneration) {
@@ -317,19 +335,14 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
         return;
       }
 
-      // Phase 1a: flush final streamed text
-      cancelFlushTimeout();
-      const flushChatId = streamChatId || progressChatId || config.telegram.allowedUserId;
-      if (flushChatId) {
-        await flushResponseText(flushChatId, true).catch(() => {});
-      }
-
-      // Build tool summary and footer
+      // Finalize stream with footer
       const toolSummary = buildToolSummary(toolCallMap);
       const duration = Date.now() - promptStartTime;
       const durationStr = duration > 60_000
         ? `${Math.floor(duration / 60_000)}m ${Math.floor((duration % 60_000) / 1000)}s`
         : `${Math.floor(duration / 1000)}s`;
+
+      await responseStreamer.finalize(toolSummary, durationStr);
 
       // Edit progress message to show done status
       if (progressChatId && progressMessageId) {
@@ -339,29 +352,6 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
         } catch (e) {
           logger.warn("[Bot] Failed to edit final progress:", e);
         }
-      }
-
-      // Session footer: usage + duration
-      let footer = "";
-      if (lastUsage) {
-        footer = `⏱️ ${durationStr}  🤖 ${lastUsage.inputTokens}→${lastUsage.outputTokens} tok`;
-        if (lastUsage.cost > 0) {
-          footer += `  💰 $${lastUsage.cost.toFixed(4)}`;
-        }
-      } else {
-        footer = `⏱️ ${durationStr}`;
-      }
-      if (toolSummary) {
-        footer = `⚙️ ${toolSummary}\n` + footer;
-      }
-      if (streamMessageId) {
-        // Send footer as a new message (not streamed)
-        bot.api.sendMessage(progressChatId!, footer, { parse_mode: "Markdown", reply_markup: homeKeyboard }).catch(() => {
-          bot.api.sendMessage(progressChatId!, footer, { reply_markup: homeKeyboard }).catch(() => {});
-        });
-      } else if (!toolSummary) {
-        // No stream was started and no tools — send a simple done
-        await ctx.reply("✅ Done");
       }
 
       // Phase 3b: upload written files as documents
@@ -411,12 +401,9 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
       // API error — retry with backoff (PoolTimeout, network errors, etc.)
       const isRetryable = retry < MAX_PROMPT_RETRIES && RETRYABLE_ERRORS.some(e => msg.includes(e) || stderr.includes(e));
       if (isRetryable) {
-        cancelFlushTimeout();
+        responseStreamer.abort();
         progressText = "";
-        accumulatedResponse = "";
         toolCallMap = new Map();
-        streamMessageId = null;
-        streamChatId = null;
         const backoff = 1000 * (1 + retry);
         await ctx.reply(`🔄 **Erreur API** (PoolTimeout). Nouvelle tentative dans ${backoff / 1000}s... (tentative ${retry + 1}/${MAX_PROMPT_RETRIES})`);
         await new Promise(r => setTimeout(r, backoff));
@@ -430,12 +417,9 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
         const lastCwd = sessionManager.current?.cwd || config.vibe.projectDir;
         try {
           await sessionManager.loadSession(sid, lastCwd);
-          cancelFlushTimeout();
+          responseStreamer.abort();
           progressText = "";
-          accumulatedResponse = "";
           toolCallMap = new Map();
-          streamMessageId = null;
-          streamChatId = null;
           await ctx.reply(`🔄 Session rechargée. Je relance...`);
           recovered = true;
           await runPrompt(acpClient, ctx, sid, generation, stopTyping, retry + 1);
@@ -445,12 +429,9 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
         }
         try {
           const newSid = await sessionManager.createSession(lastCwd);
-          cancelFlushTimeout();
+          responseStreamer.abort();
           progressText = "";
-          accumulatedResponse = "";
           toolCallMap = new Map();
-          streamMessageId = null;
-          streamChatId = null;
           await ctx.reply(`🔄 Nouvelle session créée. Je relance...`);
           recovered = true;
           await runPrompt(acpClient, ctx, newSid, generation, stopTyping, retry + 1);
@@ -469,17 +450,24 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
         busy = false;
         progressChatId = null;
         progressMessageId = null;
-        cancelFlushTimeout();
-        streamMessageId = null;
-        streamChatId = null;
-        accumulatedResponse = "";
-        thinkingText = "";
-        hasShownThinking = false;
-        thoughtLines = 0;
+        keyboardManager.flushKeyboard();
       }
       updatePinnedMessage();
     }
   }
+
+  const PERMISSION_FEEDBACK: Record<string, string> = {
+    "allow_once": "✅ Autorisé une fois",
+    "allow_always": "🔁 Toujours autorisé",
+    "once": "✅ Autorisé une fois",
+    "always": "🔁 Toujours autorisé",
+    "deny": "❌ Refusé",
+    "reject": "❌ Refusé",
+    "cancel": "❌ Refusé",
+    "allow": "✅ Autorisé",
+  };
+
+  let alwaysAllowedSet = new Set<string>();
 
   // === CALLBACK QUERY HANDLER ===
   // Handle ALL callback queries with regex catcher
@@ -500,21 +488,11 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
           pendingPermission = null;
         }
         // Send accumulated progress before acknowledging abort
-        cancelFlushTimeout();
-        if (streamChatId && accumulatedResponse) {
-          await flushResponseText(streamChatId, true).catch(() => {});
-        }
+        responseStreamer.cancelWithAccumulated().catch(() => {});
         if (progressText) {
           await ctx.reply(`📝 **Accumulé avant annulation:**\n\n${progressText.slice(0, 2000)}`);
         }
         await ctx.editMessageText("⏹️ Annulé").catch(() => {});
-        cancelFlushTimeout();
-        streamMessageId = null;
-        streamChatId = null;
-        accumulatedResponse = "";
-        thinkingText = "";
-        hasShownThinking = false;
-        thoughtLines = 0;
         busy = false;
         updatePinnedMessage();
       } else {
@@ -535,7 +513,12 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
           try {
             logger.info(`[Permission] Responding id=${permId} option=${optionId}`);
             await acpClient.respondPermission(pendingPermission.id, optionId);
-            await ctx.editMessageText(`✅ ${optionId}`);
+            const feedback = PERMISSION_FEEDBACK[optionId] || `✅ ${optionId}`;
+            await ctx.editMessageText(feedback);
+            if (optionId === "allow_always" || optionId === "always") {
+              alwaysAllowedSet.add(`perm:${pendingPermission.sessionId}:${optionId}`);
+              logger.info(`[Permission] Always allowed set, total=${alwaysAllowedSet.size}`);
+            }
           } catch (err) {
             await ctx.editMessageText(`❌ ${err}`).catch(() => {});
           }
@@ -563,6 +546,8 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
       try {
         await sessionManager.setModel(sid, modelId);
         await ctx.editMessageText(`✅ Model: \`${modelId}\``, { parse_mode: "Markdown" });
+        keyboardManager.updateModel(modelId);
+        keyboardManager.refreshKeyboard();
         updatePinnedMessage();
       } catch (err) {
         await ctx.editMessageText(`❌ ${err}`).catch(() => {});
@@ -577,6 +562,8 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
       try {
         await sessionManager.setMode(sid, modeId);
         await ctx.editMessageText(`✅ Mode: \`${modeId}\``, { parse_mode: "Markdown" });
+        keyboardManager.updateMode(modeId);
+        keyboardManager.refreshKeyboard();
         updatePinnedMessage();
       } catch (err) {
         await ctx.editMessageText(`❌ ${err}`).catch(() => {});
@@ -656,6 +643,26 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
       return;
     }
 
+    // Question response
+    if (isQuestionSelect(data)) {
+      const { questionIndex, optionIndex } = parseQuestionData(data);
+      if (!activeQuestion || activeQuestion.questionIndex !== questionIndex) {
+        await ctx.answerCallbackQuery({ text: "⏳ Question expirée" }).catch(() => {});
+        return;
+      }
+      await ctx.answerCallbackQuery().catch(() => {});
+      const answerText = activeQuestion.options[optionIndex];
+      if (answerText && activeQuestion.sessionId) {
+        logger.info(`[Question] Answering idx=${optionIndex} with "${answerText}"`);
+        acpClient.sendPrompt(activeQuestion.sessionId, answerText).catch((err) => {
+          logger.error("[Question] Failed to send answer:", err);
+        });
+      }
+      await ctx.editMessageText(`✅ ${answerText}`).catch(() => {});
+      activeQuestion = null;
+      return;
+    }
+
     await ctx.answerCallbackQuery({ text: "Unknown action" }).catch(() => {});
     logger.warn(`[Callback] Unhandled callback data="${data}"`);
   });
@@ -690,19 +697,22 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
           permissionTimeout = null;
         }, 600_000); // 10 minutes
       }
-    }, toolCallMap, (text) => {
+    }, toolCallMap, changedFiles, toolCountWrapper, (sessionId: string, questionText: string, options: string[]) => {
+      // Interactive question — show inline menu
+      const menu = buildQuestionMenu(Date.now(), questionText, options);
+      const chatId = config.telegram.allowedUserId;
+      bot.api.sendMessage(chatId, menu.text, { parse_mode: "Markdown", reply_markup: menu.keyboard }).catch(() => {});
+      activeQuestion = { sessionId, questionIndex: Date.now(), options, messageId: null };
+    }, (text) => {
       // Phase 1a: real-time text streaming
-      accumulatedResponse += text;
-      scheduleFlushResponse(config.telegram.allowedUserId);
+      responseStreamer.appendResponse(text);
     }, (text) => {
       // Phase 1b: thinking text
-      const lines = text.split("\n").length;
-      thoughtLines += lines;
-      thinkingText += text;
-      hasShownThinking = true;
-      scheduleFlushResponse(config.telegram.allowedUserId);
+      responseStreamer.appendThinking(text);
     }, (usage) => {
-      lastUsage = usage;
+      responseStreamer.setUsage(usage);
+      keyboardManager.updateUsage(usage.inputTokens, usage.outputTokens, usage.cost);
+      keyboardManager.refreshKeyboard();
     }).catch((err) => {
       logger.error("[Bot] notification error:", err);
     });
@@ -1103,6 +1113,9 @@ async function handleAcpNotification(
   flushProgress: () => void,
   setPendingPermission: (p: { id: number; sessionId: string } | null) => void,
   toolCallMap: Map<string, { name: string; kind: string; input?: Record<string, unknown> }>,
+  changedFiles: Set<string>,
+  toolCountWrapper: { n: number },
+  onQuestion?: (sessionId: string, questionText: string, options: string[]) => void,
   onTextChunk?: (text: string) => void,
   onThinkingChunk?: (text: string) => void,
   onUsage?: (usage: { inputTokens: number; outputTokens: number; cost: number }) => void,
@@ -1189,13 +1202,29 @@ async function handleAcpNotification(
       logger.debug(`[ToolCall] id=${toolCallId} name=${toolName} kind=${kind} input=${JSON.stringify(input)}`);
       const existing = toolCallMap.get(toolCallId);
       if (input) {
+        // Interactive question — show inline keyboard with options
+        if ((kind === "question" || toolName === "question") && Array.isArray(input.options) && input.options.length > 0 && onQuestion) {
+          const questionText = (input.question || input.text || input.message || "") as string;
+          const options = input.options as string[];
+          onQuestion(params.sessionId as string, questionText, options);
+          toolCallMap.set(toolCallId, { name: toolName, kind, input });
+          return;
+        }
         toolCallMap.set(toolCallId, { name: toolName, kind, input });
+        toolCountWrapper.n++;
+        // Track changed files for pinned message
+        if ((kind === "write" || kind === "edit" || toolName === "write" || toolName === "write_file" || toolName === "edit") && input.filePath) {
+          changedFiles.add(input.filePath as string);
+        } else if ((kind === "write" || kind === "edit") && input.path) {
+          changedFiles.add(input.path as string);
+        }
         // Send a new message showing the tool call with full details
         const toolLine = formatToolCallLine(toolName, kind, input);
         const chatId = config.telegram.allowedUserId;
         bot.api.sendMessage(chatId, toolLine, { parse_mode: "Markdown" }).catch(() => {});
       } else if (!existing) {
         toolCallMap.set(toolCallId, { name: toolName, kind, input: undefined });
+        toolCountWrapper.n++;
       }
       flushProgress();
       return;
@@ -1327,6 +1356,12 @@ function escapeHtml(text: string): string {
 
 function escapeMarkdown(text: string): string {
   return text.replace(/([_*\[\]()~`>#+\-=|{}.!])/g, "\\$1");
+}
+
+function formatFileSizeStatic(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)}KB`;
+  return `${bytes}B`;
 }
 
 function formatToolInput(toolName: string, input: Record<string, unknown>): string {

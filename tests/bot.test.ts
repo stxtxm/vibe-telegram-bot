@@ -15,7 +15,7 @@ vi.mock("../src/utils/logger.js", () => ({
 
 vi.mock("grammy", () => ({
   Bot: vi.fn(() => ({
-    api: { setMyCommands: vi.fn(), sendMessage: vi.fn(), editMessageText: vi.fn() },
+    api: { setMyCommands: vi.fn(), sendMessage: vi.fn(), editMessageText: vi.fn(), deleteMessage: vi.fn(), pinChatMessage: vi.fn(), sendChatAction: vi.fn() },
     use: vi.fn(),
     command: vi.fn(),
     on: vi.fn(),
@@ -25,6 +25,13 @@ vi.mock("grammy", () => ({
     text: vi.fn().mockReturnThis(),
     row: vi.fn().mockReturnThis(),
   })),
+  Keyboard: vi.fn().mockImplementation(function () {
+    return {
+      text: vi.fn().mockReturnThis(),
+      row: vi.fn().mockReturnThis(),
+      resized: vi.fn().mockReturnThis(),
+    };
+  }),
 }));
 
 // Now import the testable functions
