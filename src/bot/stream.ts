@@ -140,8 +140,8 @@ export class ResponseStreamer {
       return;
     }
 
-    // Truncate for editMessageText (Telegram 4096 limit)
-    const displayText = text.length > TEXT_LIMIT ? text.slice(0, TEXT_LIMIT) + "…" : text;
+    // Truncate for editMessageText (Telegram 4096 limit), preserving HTML tag integrity
+    const displayText = text.length > TEXT_LIMIT ? this.truncateHtml(text, TEXT_LIMIT) : text;
 
     const sig = this.signature(displayText);
     if (!isFinal && sig === s.lastSentSignature) return;
@@ -178,8 +178,8 @@ export class ResponseStreamer {
   }
 
   private async sendFreshMessage(text: string, s: StreamState): Promise<void> {
-    // Also cap fresh messages to TEXT_LIMIT
-    const displayText = text.length > TEXT_LIMIT ? text.slice(0, TEXT_LIMIT) + "…" : text;
+    // Also cap fresh messages to TEXT_LIMIT, preserving HTML tag integrity
+    const displayText = text.length > TEXT_LIMIT ? this.truncateHtml(text, TEXT_LIMIT) : text;
     try {
       const msg = await this.bot.api.sendMessage(s.chatId, displayText || "⏳ Thinking...", { parse_mode: "HTML" } as never);
       s.streamMessageId = msg.message_id;
@@ -207,6 +207,28 @@ export class ResponseStreamer {
       text += this.escapeHtml(accumulatedText);
     }
     return text;
+  }
+
+  private truncateHtml(text: string, max: number): string {
+    if (text.length <= max) return text;
+    const truncated = text.slice(0, max);
+    // Close any unclosed HTML tags in the truncated text
+    const tagStack: string[] = [];
+    const tagRe = /<\/?([a-zA-Z]+)[^>]*>/g;
+    let match: RegExpExecArray | null;
+    while ((match = tagRe.exec(truncated))) {
+      if (match[0].startsWith("</")) {
+        if (tagStack.length > 0) tagStack.pop();
+      } else if (!match[0].endsWith("/>")) {
+        if (!match[1].startsWith("/")) tagStack.push(match[1]);
+      }
+    }
+    // Append closing tags in reverse order
+    let result = truncated;
+    for (let i = tagStack.length - 1; i >= 0; i--) {
+      result += `</${tagStack[i]}>`;
+    }
+    return result + "…";
   }
 
   private signature(text: string): string {
