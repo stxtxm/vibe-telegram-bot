@@ -1169,7 +1169,6 @@ async function handleAcpNotification(
     if (!update) return;
     const sessionUpdate = update.sessionUpdate as string;
 
-    logger.debug(`[Notification] sessionUpdate=${sessionUpdate}`);
     if (sessionUpdate === "session_info_update") return;
     if (sessionUpdate === "available_commands_update") return;
 
