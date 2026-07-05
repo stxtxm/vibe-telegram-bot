@@ -83,25 +83,29 @@ async function main(): Promise<void> {
 
   // Restore last active session from persisted file
   const saved = await sessionManager.loadLastSession();
-  if (saved) {
+  let sessionOk = false;
+  if (saved?.sessionId && saved.sessionId.length > 5) {
     try {
       await sessionManager.loadSession(saved.sessionId, saved.cwd);
       logger.info(`[Session] Restored saved session ${saved.sessionId.slice(0, 8)}...`);
+      sessionOk = true;
     } catch {
       logger.warn(`[Session] Saved session ${saved.sessionId.slice(0, 8)}... not found on server, creating new`);
-      try {
-        await sessionManager.createSession(saved.cwd);
-      } catch (err) {
-        logger.warn("[Session] Failed to create fallback session:", err);
-      }
     }
-  } else {
-    // No saved session — create a fresh one
+  }
+  if (!sessionOk) {
+    const cwd = (saved?.cwd && saved.cwd.length > 2) ? saved.cwd : config.vibe.projectDir;
     try {
-      await sessionManager.createSession(config.vibe.projectDir);
-      logger.info("[Session] Created fresh session (no saved session)");
-    } catch (err) {
-      logger.warn("[Session] Failed to create session:", err);
+      await sessionManager.createSession(cwd);
+      logger.info(`[Session] Created session at ${cwd}`);
+    } catch {
+      logger.warn(`[Session] Failed at ${cwd}, falling back to projectDir`);
+      try {
+        await sessionManager.createSession(config.vibe.projectDir);
+        logger.info("[Session] Created session at projectDir");
+      } catch (err2) {
+        logger.error("[Session] Failed to create session even at projectDir:", err2);
+      }
     }
   }
   // Sync remote sessions for /sessions listing (best-effort)
