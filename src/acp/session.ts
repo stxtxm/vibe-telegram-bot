@@ -6,7 +6,13 @@ import type { AcpClient } from "./client.js";
 import type { ACPModel, ACPMode, ACPConfigOption, ACPSessionInfo } from "./protocol.js";
 
 const DATA_DIR = join(process.cwd(), "data");
-const CWD_FILE = join(DATA_DIR, "last-cwd.json");
+const LAST_SESSION_FILE = join(DATA_DIR, "last-session.json");
+
+export interface PersistedSession {
+  sessionId: string;
+  cwd: string;
+  title?: string;
+}
 
 export class SessionManager {
   private client: AcpClient;
@@ -17,46 +23,29 @@ export class SessionManager {
     this.client = client;
   }
 
-  async loadLastCwd(): Promise<string | null> {
+  async loadLastSession(): Promise<PersistedSession | null> {
     try {
-      const raw = await fs.readFile(CWD_FILE, "utf-8");
-      const data = JSON.parse(raw);
-      return data.cwd || null;
+      const raw = await fs.readFile(LAST_SESSION_FILE, "utf-8");
+      return JSON.parse(raw) as PersistedSession;
     } catch {
       return null;
     }
   }
 
-  async saveCwd(cwd: string): Promise<void> {
+  private async saveLastSession(): Promise<void> {
+    if (!this.currentId) return;
+    const s = this.sessions.get(this.currentId);
+    if (!s) return;
     try {
       await fs.mkdir(DATA_DIR, { recursive: true });
-      await fs.writeFile(CWD_FILE, JSON.stringify({ cwd }, null, 2));
+      const data: PersistedSession = {
+        sessionId: s.id,
+        cwd: s.cwd,
+        title: s.title,
+      };
+      await fs.writeFile(LAST_SESSION_FILE, JSON.stringify(data, null, 2));
     } catch (err) {
-      logger.warn("[Session] Failed to persist cwd:", err);
-    }
-  }
-
-  async loadRemoteSessions(): Promise<void> {
-    try {
-      const resp: any = await this.client.listSessions();
-      const sessions = resp?.sessions ?? [];
-      for (const s of sessions) {
-        if (!this.sessions.has(s.sessionId)) {
-          this.sessions.set(s.sessionId, {
-            id: s.sessionId,
-            cwd: s.cwd || config.vibe.projectDir,
-            title: s.title,
-          });
-        }
-      }
-      // Restore the last session (if any)
-      if (sessions.length > 0) {
-        const last = sessions[sessions.length - 1];
-        this.currentId = last.sessionId;
-        logger.info(`[Session] Restored session ${this.currentId?.slice(0, 8)}...`);
-      }
-    } catch (err) {
-      logger.warn("[Session] Failed to load remote sessions:", err);
+      logger.warn("[Session] Failed to persist session:", err);
     }
   }
 
@@ -66,6 +55,7 @@ export class SessionManager {
 
   set currentSessionId(id: string | null) {
     this.currentId = id;
+    if (id) this.saveLastSession();
   }
 
   get current(): SessionState | undefined {
@@ -82,7 +72,7 @@ export class SessionManager {
       configOptions: resp?.configOptions,
     });
     this.currentId = sessionId;
-    await this.saveCwd(cwd);
+    await this.saveLastSession();
     logger.info(`[Session] loaded ${sessionId.slice(0, 8)}...`);
     return sessionId;
   }
@@ -98,7 +88,7 @@ export class SessionManager {
       configOptions: resp.configOptions,
     });
     this.currentId = resp.sessionId;
-    await this.saveCwd(cwd);
+    await this.saveLastSession();
     logger.info(`[Session] created ${resp.sessionId}`);
     return resp.sessionId;
   }
@@ -106,7 +96,27 @@ export class SessionManager {
   async updateCwd(sessionId: string, newCwd: string): Promise<void> {
     const s = this.sessions.get(sessionId);
     if (s) s.cwd = newCwd;
-    await this.saveCwd(newCwd);
+    if (this.currentId === sessionId) {
+      await this.saveLastSession();
+    }
+  }
+
+  async syncRemoteSessions(): Promise<void> {
+    try {
+      const resp: any = await this.client.listSessions();
+      const sessions = resp?.sessions ?? [];
+      for (const s of sessions) {
+        if (!this.sessions.has(s.sessionId)) {
+          this.sessions.set(s.sessionId, {
+            id: s.sessionId,
+            cwd: s.cwd || config.vibe.projectDir,
+            title: s.title,
+          });
+        }
+      }
+    } catch (err) {
+      logger.warn("[Session] Failed to load remote sessions:", err);
+    }
   }
 
   async setModel(sessionId: string, modelId: string): Promise<void> {
@@ -117,7 +127,6 @@ export class SessionManager {
       if (resp?.models) {
         s.models = resp.models;
       } else if (s.models) {
-        // Response doesn't include models — optimistically update local state
         s.models.currentModelId = modelId;
       }
     }
@@ -131,7 +140,6 @@ export class SessionManager {
       if (resp?.modes) {
         s.modes = resp.modes;
       } else if (s.modes) {
-        // Response doesn't include modes — optimistically update local state
         s.modes.currentModeId = modeId;
       }
     }
@@ -147,14 +155,16 @@ export class SessionManager {
   async closeSession(sessionId: string): Promise<void> {
     await this.client.closeSession(sessionId);
     this.sessions.delete(sessionId);
-    if (this.currentId === sessionId) this.currentId = null;
+    if (this.currentId === sessionId) {
+      this.currentId = null;
+      try { await fs.unlink(LAST_SESSION_FILE); } catch { /* ignore */ }
+    }
   }
 
   async listSessions(): Promise<{ sessions: ACPSessionInfo[] }> {
     const resp: any = await this.client.listSessions();
     const sessions = resp?.sessions ?? [];
-    
-    // Sync remote sessions to local map
+
     for (const s of sessions) {
       if (!this.sessions.has(s.sessionId)) {
         this.sessions.set(s.sessionId, {
@@ -164,14 +174,19 @@ export class SessionManager {
         });
       }
     }
-    
+
     return { sessions };
   }
 
   async setTitle(sessionId: string, title: string): Promise<void> {
     await this.client.setTitle(sessionId, title);
     const s = this.sessions.get(sessionId);
-    if (s) s.title = title;
+    if (s) {
+      s.title = title;
+      if (this.currentId === sessionId) {
+        await this.saveLastSession();
+      }
+    }
   }
 
   async sendPrompt(sessionId: string, text: string): Promise<void> {

@@ -1290,11 +1290,11 @@ function formatToolCallLine(toolName: string, kind: string, input?: Record<strin
   const icon = TOOL_EMOJI[kind] || TOOL_EMOJI[toolName] || "🛠️";
   const fp = input?.filePath || input?.path || input?.file_path || "";
   if (kind === "read" || kind === "edit" || toolName === "read" || toolName === "edit") {
-    const path = typeof fp === "string" ? escapeMarkdown(fp) : "";
+    const path = typeof fp === "string" ? fp : "";
     return `${icon} **${toolName}** \`${path}\``;
   }
   if (kind === "write" || toolName === "write" || toolName === "write_file") {
-    const path = typeof fp === "string" ? escapeMarkdown(fp) : "";
+    const path = typeof fp === "string" ? fp : "";
     const lines = (input?.content && typeof input.content === "string") ? input.content.split("\n").length : 0;
     const lineInfo = lines > 0 ? ` (+${lines})` : "";
     return `${icon} **${toolName}** \`${path}\`${lineInfo}`;
@@ -1306,11 +1306,11 @@ function formatToolCallLine(toolName: string, kind: string, input?: Record<strin
   }
   if (kind === "grep" || kind === "search" || toolName === "grep") {
     const q = (input?.query || input?.pattern || "") as string;
-    return `${icon} **${toolName}** \`${escapeMarkdown(q)}\``;
+    return `${icon} **${toolName}** \`${q}\``;
   }
   if (kind === "glob" || toolName === "glob") {
     const p = (input?.pattern || "") as string;
-    return `${icon} **${toolName}** \`${escapeMarkdown(p)}\``;
+    return `${icon} **${toolName}** \`${p}\``;
   }
   if (kind === "question" || toolName === "question") {
     const q = (input?.question || input?.text || input?.message || "") as string;
@@ -1318,7 +1318,7 @@ function formatToolCallLine(toolName: string, kind: string, input?: Record<strin
   }
   // Fallback: show whatever detail we can find
   const detail = (input?.url || input?.name || input?.query || input?.command || input?.path || fp || input?.text || "") as string;
-  if (detail) return `${icon} **${toolName}** \`${escapeMarkdown(String(detail).slice(0, 300))}\``;
+  if (detail) return `${icon} **${toolName}** \`${String(detail).slice(0, 300)}\``;
   return `${icon} **${toolName}**`;
 }
 
@@ -1371,16 +1371,16 @@ function formatToolInput(toolName: string, input: Record<string, unknown>): stri
     if (cmd) return `\n\`\`\`bash\n$ ${cmd.slice(0, 1000)}\n\`\`\``;
   }
   if (/^(read|write|write_file|edit)$/.test(toolName)) {
-    if (fp) return `\n📄 \`${escapeMarkdown(fp.slice(0, 300))}\``;
+    if (fp) return `\n📄 \`${fp.slice(0, 300)}\``;
   }
   if (toolName === "search" || toolName === "grep") {
     const q = input.query as string || input.pattern as string || "";
-    if (q) return `\n🔍 \`${escapeMarkdown(q.slice(0, 300))}\``;
+    if (q) return `\n🔍 \`${q.slice(0, 300)}\``;
   }
   if (toolName === "glob") {
     const p = input.pattern as string || "";
-    if (p) return `\n🔎 \`${escapeMarkdown(p.slice(0, 300))}\``;
+    if (p) return `\n🔎 \`${p.slice(0, 300)}\``;
   }
   const fallback = JSON.stringify(input).slice(0, 500);
-  return fallback ? `\n\`${escapeMarkdown(fallback)}\`` : "";
+  return fallback ? `\n\`${fallback}\`` : "";
 }

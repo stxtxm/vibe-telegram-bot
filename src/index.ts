@@ -81,34 +81,31 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Restore previous session and persisted cwd
-  await sessionManager.loadRemoteSessions();
-  const lastCwd = await sessionManager.loadLastCwd();
-  const existingSid = sessionManager.currentSessionId;
-  if (existingSid && lastCwd) {
-    // Load the session into memory (ACP server just started, sessions are on disk only)
+  // Restore last active session from persisted file
+  const saved = await sessionManager.loadLastSession();
+  if (saved) {
     try {
-      await sessionManager.loadSession(existingSid, lastCwd);
-      logger.info(`[Session] Loaded session ${existingSid.slice(0, 8)}...`);
+      await sessionManager.loadSession(saved.sessionId, saved.cwd);
+      logger.info(`[Session] Restored saved session ${saved.sessionId.slice(0, 8)}...`);
     } catch {
-      logger.warn(`[Session] Could not load session ${existingSid.slice(0, 8)}..., creating new`);
-      const fallbackCwd = sessionManager.current?.cwd || config.vibe.projectDir || lastCwd;
+      logger.warn(`[Session] Saved session ${saved.sessionId.slice(0, 8)}... not found on server, creating new`);
       try {
-        const newSid = await sessionManager.createSession(fallbackCwd);
-        logger.info(`[Session] Created fallback session ${newSid.slice(0, 8)}...`);
+        await sessionManager.createSession(saved.cwd);
       } catch (err) {
         logger.warn("[Session] Failed to create fallback session:", err);
       }
     }
-  } else if (!existingSid && lastCwd) {
-    // No remote sessions but we have a persisted cwd — auto-create a session
+  } else {
+    // No saved session — create a fresh one
     try {
-      await sessionManager.createSession(lastCwd);
-      logger.info(`[Session] Auto-created session at ${lastCwd}`);
+      await sessionManager.createSession(config.vibe.projectDir);
+      logger.info("[Session] Created fresh session (no saved session)");
     } catch (err) {
-      logger.warn("[Session] Failed to auto-create session:", err);
+      logger.warn("[Session] Failed to create session:", err);
     }
   }
+  // Sync remote sessions for /sessions listing (best-effort)
+  sessionManager.syncRemoteSessions().catch(() => {});
 
   const bot = await createBot(acpClient, sessionManager, todoManager);
 
