@@ -195,7 +195,7 @@ export class ResponseStreamer {
       text += `<blockquote>${escaped}</blockquote>\n\n`;
     }
     if (accumulatedText) {
-      text += accumulatedText;
+      text += this.escapeHtml(accumulatedText);
     }
     return text;
   }
@@ -221,24 +221,13 @@ export class ResponseStreamer {
     this.cancelTimer();
     await this.flushState(true);
 
-    // Edit progress message to done
-    if (s.streamMessageId) {
-      const doneLine = toolSummary ? `✅ **Done** — ${toolSummary}` : "✅ **Done**";
-      try {
-        await this.bot.api.editMessageText(s.chatId, s.streamMessageId, doneLine, { parse_mode: "Markdown" } as never);
-        s.streamMessageId = null;
-      } catch {
-        // ignore
-      }
-    }
-
-    // Send footer
-    await this.sendFooter(toolSummary, duration);
+    // Append footer to the stream message (keep the response text visible)
+    await this.appendFooter(toolSummary, duration);
 
     this.cleanup();
   }
 
-  private async sendFooter(toolSummary: string, duration: string): Promise<void> {
+  private async appendFooter(toolSummary: string, duration: string): Promise<void> {
     const s = this.state;
     if (!s) return;
 
@@ -255,8 +244,25 @@ export class ResponseStreamer {
       footer = `⚙️ ${toolSummary}\n` + footer;
     }
 
+    if (s.streamMessageId) {
+      // Try to append footer below the existing response text
+      const existing = this.buildCombinedText();
+      if (existing) {
+        const updated = existing + `\n\n━━━━━━━━━━━━━━━━━━\n${footer}`;
+        try {
+          await this.bot.api.editMessageText(s.chatId, s.streamMessageId, updated, { parse_mode: "HTML" } as never);
+          s.streamMessageId = null;
+          return;
+        } catch {
+          // Fall through to send separate message
+        }
+      }
+    }
+
+    // Fallback: send footer as a new message
     try {
-      await this.bot.api.sendMessage(s.chatId, footer, { parse_mode: "Markdown" } as never);
+      const fallbackText = `✅ **Done**\n${footer}`;
+      await this.bot.api.sendMessage(s.chatId, fallbackText, { parse_mode: "Markdown" } as never);
     } catch {
       try { await this.bot.api.sendMessage(s.chatId, footer); } catch { /* ignore */ }
     }
