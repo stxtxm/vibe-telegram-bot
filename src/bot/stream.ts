@@ -86,8 +86,9 @@ export class ResponseStreamer {
   }
 
   appendResponse(text: string): void {
-    if (!this.state?.isActive) return;
+    if (!this.state?.isActive) { logger.debug("[Stream] appendResponse skipped: inactive"); return; }
     this.state.accumulatedText += text;
+    logger.debug(`[Stream] appendResponse: +${text.length} chars, total=${this.state.accumulatedText.length}`);
     this.scheduleFlush(false);
   }
 
@@ -131,10 +132,13 @@ export class ResponseStreamer {
 
   private async flushState(isFinal: boolean): Promise<void> {
     const s = this.state;
-    if (!s || !s.isActive) return;
+    if (!s || !s.isActive) { logger.debug("[Stream] flushState: inactive"); return; }
 
     const text = this.buildCombinedText();
-    if (!text && !isFinal) return;
+    if (!text && !isFinal) {
+      logger.debug("[Stream] flushState: no text, not final");
+      return;
+    }
 
     // Truncate for editMessageText (Telegram 4096 limit)
     const displayText = text.length > TEXT_LIMIT ? text.slice(0, TEXT_LIMIT) + "…" : text;
@@ -221,7 +225,8 @@ export class ResponseStreamer {
 
   async finalize(toolSummary: string, duration: string): Promise<void> {
     const s = this.state;
-    if (!s) return;
+    if (!s) { logger.debug("[Stream] finalize: no state"); return; }
+    logger.debug(`[Stream] finalize: acc=${s.accumulatedText.length} chars, thinking=${s.thinkingText.length}, msgId=${s.streamMessageId}`);
 
     this.cancelTimer();
     await this.flushState(true);
@@ -229,6 +234,7 @@ export class ResponseStreamer {
     // If response was truncated, send the full text as a separate message
     const rawLen = (s.accumulatedText || "").length;
     if (rawLen > TEXT_LIMIT) {
+      logger.debug("[Stream] sending full response as separate messages");
       this.sendFullResponse(s).catch(() => {});
     }
 
