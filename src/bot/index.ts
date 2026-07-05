@@ -1218,10 +1218,6 @@ async function handleAcpNotification(
         } else if ((kind === "write" || kind === "edit") && input.path) {
           changedFiles.add(input.path as string);
         }
-        // Send a new message showing the tool call with full details
-        const toolLine = formatToolCallLine(toolName, kind, input);
-        const chatId = config.telegram.allowedUserId;
-        bot.api.sendMessage(chatId, toolLine, { parse_mode: "Markdown" }).catch(() => {});
       } else if (!existing) {
         toolCallMap.set(toolCallId, { name: toolName, kind, input: undefined });
         toolCountWrapper.n++;
