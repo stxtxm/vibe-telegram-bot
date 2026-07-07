@@ -35,6 +35,7 @@ export class ResponseStreamer {
   private chatId: number;
   private state: StreamState | null = null;
   private taskQ: Promise<void> = Promise.resolve();
+  contextChars = 0;
 
   constructor(bot: Bot<Context>, chatId: number) {
     this.bot = bot;
@@ -147,7 +148,10 @@ export class ResponseStreamer {
       }
 
       if (s.progressMessageId) {
-        this.bot.api.editMessageText(s.chatId, s.progressMessageId, "💭...", {
+        const ctxWarn = this.contextChars > 40_000
+          ? ` [${(this.contextChars / 1000).toFixed(0)}K]`
+          : "";
+        this.bot.api.editMessageText(s.chatId, s.progressMessageId, `💭...${ctxWarn}`, {
           reply_markup: new InlineKeyboard().text("Abort", `abort:${s.generation}`),
         }).catch(() => {});
       }

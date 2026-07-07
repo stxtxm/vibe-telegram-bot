@@ -83,6 +83,9 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
   let contextChars = 0;
   let contextMessages = 0;
 
+  // Flag to suppress streaming notifications during auto-compact
+  let isCompacting = false;
+
   // Permission state
   let pendingPermission: { id: number; sessionId: string } | null = null;
   let permissionTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -366,13 +369,30 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
   async function runPrompt(acpClient: AcpClient, ctx: Context, sid: string, generation: number, stopTyping?: () => void, retry = 0) {
     const text = ctx.message?.text;
     if (!text) return;
-    let effectiveText = text;
+    // Clean up input text — trim whitespace, collapse excessive newlines
+    const cleanText = text.trim().replace(/\n{3,}/g, '\n\n').replace(/[ \t]+$/gm, '');
+    let effectiveText = cleanText;
     if (pendingUpload) {
-      effectiveText = `[File uploaded to ${pendingUpload}]\n\n${text}`;
+      const relPath = pendingUpload.startsWith(config.vibe.projectDir)
+        ? pendingUpload.slice(config.vibe.projectDir.length + 1)
+        : pendingUpload;
+      effectiveText = `[File uploaded to ${relPath}]\n\n${cleanText}`;
       pendingUpload = null;
     }
     let recovered = false;
     try {
+      // Auto-compact if context exceeds threshold
+      const AUTO_COMPACT_THRESHOLD = 50_000;
+      if (acpClient.contextChars > AUTO_COMPACT_THRESHOLD) {
+        logger.info(`[Compact] Auto-compact triggered: ${acpClient.contextChars} chars > ${AUTO_COMPACT_THRESHOLD}`);
+        isCompacting = true;
+        await acpClient.sendPrompt(sid,
+          "Compact/compress the conversation history above into a short concise summary, " +
+          "preserving all decisions, code changes, and important context. Output only the summary."
+        );
+        isCompacting = false;
+        await new Promise(r => setTimeout(r, 1500));
+      }
       const result = await acpClient.sendPrompt(sid, effectiveText) as Record<string, unknown> | undefined;
 
       // Stale — a newer prompt has superseded this one
@@ -446,6 +466,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
         await ctx.reply(`🔄 **Erreur API** (PoolTimeout). Nouvelle tentative dans ${backoff / 1000}s... (tentative ${retry + 1}/${MAX_PROMPT_RETRIES})`);
         await new Promise(r => setTimeout(r, backoff));
         recovered = true;
+        effectiveText = `[retry after timeout]\n\n${effectiveText}`;
         await runPrompt(acpClient, ctx, sid, generation, stopTyping, retry + 1);
         return;
       }
@@ -740,10 +761,12 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
       bot.api.sendMessage(chatId, menu.text, { parse_mode: "Markdown", reply_markup: menu.keyboard }).catch(() => {});
       activeQuestion = { sessionId, questionIndex: Date.now(), options, messageId: null };
     }, (text) => {
-      // Phase 1a: real-time text streaming
+      if (isCompacting) return;
+      responseStreamer.contextChars = acpClient.contextChars;
       responseStreamer.appendResponse(text);
     }, (text) => {
-      // Phase 1b: thinking text
+      if (isCompacting) return;
+      responseStreamer.contextChars = acpClient.contextChars;
       responseStreamer.appendThinking(text);
     }, (usage) => {
       responseStreamer.setUsage(usage);
