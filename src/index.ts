@@ -1,10 +1,18 @@
 import fs from "node:fs";
+import { Bot } from "grammy";
 import { config } from "./config.js";
 import { setLogLevel, logger } from "./utils/logger.js";
 import { AcpClient } from "./acp/client.js";
 import { SessionManager } from "./acp/session.js";
 import { TodoManager } from "./todo.js";
 import { createBot } from "./bot/index.js";
+import {
+  loadApiKey,
+  validateApiKey,
+  startSignIn,
+  pollAndExchange,
+  saveApiKey,
+} from "./acp/auth.js";
 
 const LOCK_FILE = "/tmp/vibe-telegram-bot.pid";
 const SHUTDOWN_TIMEOUT_MS = 10_000;
@@ -34,6 +42,59 @@ function removeLock(): void {
   } catch {
     // Ignore if file doesn't exist
   }
+}
+
+async function ensureValidApiKey(
+  onKeyRenewed?: () => void,
+): Promise<boolean> {
+  const key = loadApiKey();
+  if (key && (await validateApiKey(key))) {
+    logger.info("[Auth] API key is valid");
+    return true;
+  }
+
+  logger.warn("[Auth] API key missing or invalid, starting sign-in flow...");
+
+  let signInUrl: string;
+  try {
+    const attempt = await startSignIn();
+    signInUrl = attempt.signInUrl;
+  } catch (err) {
+    logger.error("[Auth] Failed to start sign-in process:", err);
+    return false;
+  }
+
+  const authBot = new Bot(config.telegram.token);
+  await authBot.api.sendMessage(
+    config.telegram.allowedUserId,
+    `🔑 Clé API Mistral invalide.\nClique ici pour te reconnecter (valide 10 min) :\n${signInUrl}\n\n⚠️ Tu peux aussi coller une clé API existante ici directement.`,
+    { link_preview_options: { is_disabled: true } },
+  );
+
+  // Start background polling — don't block startup
+  pollAndExchange()
+    .then((newKey) => {
+      saveApiKey(newKey);
+      process.env.MISTRAL_API_KEY = newKey;
+      logger.info("[Auth] API key renewed successfully");
+      return authBot.api.sendMessage(
+        config.telegram.allowedUserId,
+        "✅ Clé API renouvelée avec succès ! Redémarrage du service...",
+      );
+    })
+    .then(() => {
+      if (onKeyRenewed) onKeyRenewed();
+    })
+    .catch((err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn(`[Auth] Poll failed: ${msg}`);
+      return authBot.api.sendMessage(
+        config.telegram.allowedUserId,
+        `❌ Renouvellement de clé API impossible : ${msg}\n\n⚠️ Tu peux aussi obtenir une clé manuellement sur https://console.mistral.ai et l'envoyer ici.`,
+      );
+    });
+
+  return false;
 }
 
 async function main(): Promise<void> {
@@ -71,14 +132,29 @@ async function main(): Promise<void> {
     }
   });
 
+  const keyValid = await ensureValidApiKey(async () => {
+    // Key was renewed in background — restart ACP to pick it up
+    if (!shuttingDown) {
+      logger.info("[Auth] Restarting ACP with new API key...");
+      acpClient.stop();
+      await new Promise((r) => setTimeout(r, 1000));
+      try {
+        await acpClient.start();
+        await acpClient.initialize();
+        logger.info("[Auth] ACP restarted with new API key");
+      } catch (err) {
+        logger.error("[Auth] Failed to restart ACP:", err);
+      }
+    }
+  });
+
   await acpClient.start();
 
   try {
     await acpClient.initialize();
   } catch (err) {
-    logger.error("[ACP] Failed to initialize:", err);
-    acpClient.stop();
-    process.exit(1);
+    logger.warn(`[ACP] Initialization: ${err}`);
+    // Continue anyway — prompts will fail with bad key but bot is up for other commands
   }
 
   // Restore last active session from persisted file

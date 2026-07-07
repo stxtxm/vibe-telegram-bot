@@ -6,9 +6,15 @@ import { dirname, basename, join } from 'node:path';
 import type { AcpClient } from "../acp/client.js";
 import { SessionManager, type SessionState } from "../acp/session.js";
 import { TodoManager } from "../todo.js";
+import {
+  loadApiKey,
+  validateApiKey,
+  startSignIn,
+  pollAndExchange,
+  saveApiKey,
+} from "../acp/auth.js";
 
-const PROGRESS_FLUSH_INTERVAL = 1_000; // min ms between progress edits (rate limiting)
-const MAX_PROMPT_RETRIES = 2;
+const MAX_PROMPT_RETRIES = 1;
 
 // Patterns for API errors that should be retried
 const RETRYABLE_ERRORS = [
@@ -16,6 +22,10 @@ const RETRYABLE_ERRORS = [
   "API error",
   "Network error",
   "Connection error",
+  "incomplete chunked read",
+  "peer closed connection",
+  "chunked",
+  "RPC -32603",
 ];
 
 const TOOL_EMOJI: Record<string, string> = {
@@ -46,7 +56,6 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
   let progressChatId: number | null = null;
   let progressMessageId: number | null = null;
   let progressText = "";
-  let lastFlushTime = 0;
   let toolCallMap = new Map<string, { name: string; kind: string; input?: Record<string, unknown> }>();
   let promptGeneration = 0;
 
@@ -69,6 +78,10 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
 
   // Pending file upload state
   let pendingUpload: string | null = null;
+
+  // Context metrics (from ACP stderr)
+  let contextChars = 0;
+  let contextMessages = 0;
 
   // Permission state
   let pendingPermission: { id: number; sessionId: string } | null = null;
@@ -126,6 +139,15 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
       lines.push(`📊 ${usage.inputTokens}→${usage.outputTokens} tok${usage.cost > 0 ? `  💰 $${usage.cost.toFixed(4)}` : ""}`);
     }
 
+    // Context metrics from ACP stderr
+    contextChars = acpClient.contextChars;
+    contextMessages = acpClient.contextMessages;
+    if (contextChars > 0) {
+      let ctxLine = `📐 ${(contextChars / 1000).toFixed(0)}K chars`;
+      if (contextMessages > 0) ctxLine += ` · ${contextMessages} msg`;
+      lines.push(ctxLine);
+    }
+
     if (toolCountWrapper.n > 0) {
       let info = `🛠️ ${toolCountWrapper.n} tool${toolCountWrapper.n !== 1 ? "s" : ""}`;
       if (changedFiles.size > 0) {
@@ -151,7 +173,6 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     try {
       const msg = await bot.api.sendMessage(chatId, text, { parse_mode: "Markdown", disable_notification: true });
       pinnedMessageId = msg.message_id;
-      await bot.api.pinChatMessage(chatId, msg.message_id, { disable_notification: true }).catch(() => {});
     } catch (e) {
       logger.warn("[Pinned] Failed to create pinned message:", e);
     }
@@ -189,8 +210,11 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     { command: "abort", description: "Abort the current prompt" },
     { command: "rename", description: "Rename session" },
     { command: "status", description: "Show session info" },
+    { command: "compact", description: "Compress conversation context" },
     { command: "todo", description: "Manage todo list" },
     { command: "help", description: "Show help" },
+    { command: "reauth", description: "Reconnect Mistral API key" },
+    { command: "setkey", description: "Set Mistral API key manually" },
   ]);
 
   bot.command("start", wrap(startHandler(sessionManager)));
@@ -216,8 +240,11 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
   ));
   bot.command("rename", wrap(renameHandler(acpClient, sessionManager)));
   bot.command("status", statusHandler(sessionManager, () => pendingPermission, () => busy));
+  bot.command("compact", wrap(compactHandler(acpClient, sessionManager)));
   bot.command("todo", todoHandler(todoManager));
   bot.command("help", helpHandler);
+  bot.command("reauth", reauthHandler(acpClient));
+  bot.command("setkey", setkeyHandler(acpClient));
 
   // Wraps a handler to update the pinned message after completion
   function wrap(handler: (ctx: Context) => Promise<void>): (ctx: Context) => Promise<void> {
@@ -227,10 +254,34 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     };
   }
 
-  // === TEXT MESSAGE HANDLER (prompts) ===
+  // === TEXT MESSAGE HANDLER (prompts + API key injection) ===
   bot.on("message:text", async (ctx) => {
     const text = ctx.message.text;
     if (text.startsWith("/")) return;
+
+    // If message looks like a Mistral API key (~32 alphanumeric chars), save and restart
+    if (/^[A-Za-z0-9_-]{20,50}$/.test(text.trim())) {
+      const key = text.trim();
+      try {
+        const valid = await validateApiKey(key);
+        if (valid) {
+          await ctx.reply("✅ Clé API valide ! Enregistrement et redémarrage...");
+          saveApiKey(key);
+          process.env.MISTRAL_API_KEY = key;
+          logger.info("[Auth] API key updated via chat message");
+
+          // Restart ACP to pick up the new key
+          acpClient.stop();
+          await new Promise((r) => setTimeout(r, 1000));
+          await acpClient.start();
+          await acpClient.initialize();
+          await ctx.reply("✅ Service redémarré avec la nouvelle clé !");
+          return;
+        }
+      } catch {
+        // Not a valid key, continue as normal prompt
+      }
+    }
 
     const sid = sessionManager.currentSessionId;
     if (!sid) { await ctx.reply("No session. Use /start."); return; }
@@ -259,15 +310,10 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     promptStartTime = Date.now();
     updatePinnedMessage();
 
-    // Start response streamer
-    await responseStreamer.start(generation, ctx.message.message_id);
-
-    const statusMsg = await ctx.reply("⏳ Thinking...", {
-      reply_markup: new InlineKeyboard().text("Abort", `abort:${generation}`),
-    });
-    progressChatId = statusMsg.chat.id;
-    progressMessageId = statusMsg.message_id;
-    const stopTyping = startTypingInterval(statusMsg.chat.id);
+    // Start response streamer (creates the progress message with abort button)
+    progressMessageId = await responseStreamer.start(generation, ctx.message.message_id);
+    progressChatId = ctx.chat.id;
+    const stopTyping = startTypingInterval(ctx.chat.id);
 
     runPrompt(acpClient, ctx, sid, generation, stopTyping).catch((err) => {
       logger.error("[Prompt] Background error:", err);
@@ -343,16 +389,6 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
         : `${Math.floor(duration / 1000)}s`;
 
       await responseStreamer.finalize(toolSummary, durationStr);
-
-      // Edit progress message to show done status
-      if (progressChatId && progressMessageId) {
-        const doneLine = toolSummary ? `✅ **Done** — ${toolSummary}` : "✅ **Done**";
-        try {
-          await bot.api.editMessageText(progressChatId, progressMessageId, doneLine, { parse_mode: "Markdown" });
-        } catch (e) {
-          logger.warn("[Bot] Failed to edit final progress:", e);
-        }
-      }
 
       // Phase 3b: upload written files as documents
       if (progressChatId) {
@@ -495,8 +531,8 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
           acpClient.respondPermissionError(pendingPermission.id);
           pendingPermission = null;
         }
-        // Send accumulated progress before acknowledging abort
-        responseStreamer.cancelWithAccumulated().catch(() => {});
+        // Abort the streamer (sets progress to cancelled)
+        responseStreamer.abort();
         if (progressText) {
           await ctx.reply(`📝 **Accumulé avant annulation:**\n\n${progressText.slice(0, 2000)}`);
         }
@@ -677,16 +713,8 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
 
   // === ACP NOTIFICATIONS ===
   acpClient.onMessage((msg) => {
-    handleAcpNotification(msg, bot, acpClient, () => progressChatId, () => progressMessageId, (id) => { progressMessageId = id; }, (t) => { progressText += t; }, () => { return progressText; }, () => {
-      const now = Date.now();
-      if (now - lastFlushTime < PROGRESS_FLUSH_INTERVAL) return;
-      lastFlushTime = now;
-      if (progressChatId && progressMessageId) {
-        const toolSummary = buildToolSummary(toolCallMap);
-        const statusLine = toolSummary ? `⚙️ ${toolSummary}` : "🤔 Thinking...";
-        const kb = new InlineKeyboard().text("Abort", `abort:${promptGeneration}`);
-        bot.api.editMessageText(progressChatId, progressMessageId, statusLine, { reply_markup: kb }).catch(() => {});
-      }
+    handleAcpNotification(msg, bot, acpClient, () => progressChatId, () => progressMessageId, (id) => { progressMessageId = id; },     (t) => { progressText += t; }, () => { return progressText; }, () => {
+      responseStreamer.setToolSummary(buildToolSummary(toolCallMap));
     }, (p) => {
       // Clear previous timeout
       if (permissionTimeout) { clearTimeout(permissionTimeout); permissionTimeout = null; }
@@ -723,6 +751,8 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
       keyboardManager.refreshKeyboard();
     }, (summary) => {
       responseStreamer.setToolSummary(summary);
+    }, (icon, label) => {
+      responseStreamer.addToolEntry(icon, label);
     }).catch((err) => {
       logger.error("[Bot] notification error:", err);
     });
@@ -732,6 +762,9 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
   bot.catch((err) => {
     logger.error("[Bot] Unhandled error:", err.error ?? err);
   });
+
+  // Create startup pinned message (fire-and-forget)
+  updatePinnedMessage();
 
   return bot;
 }
@@ -969,6 +1002,20 @@ function closeHandler(acp: AcpClient, sm: SessionManager) {
   };
 }
 
+function compactHandler(acp: AcpClient, sm: SessionManager) {
+  return async (ctx: Context) => {
+    const sid = sm.currentSessionId;
+    if (!sid) { await ctx.reply("No session. Use /start."); return; }
+    await ctx.reply("🔄 **Compactage du contexte...** Envoi d'une demande de compression mémoire.", { parse_mode: "Markdown" });
+    try {
+      await acp.sendPrompt(sid, "Please compact/compress the conversation history to reduce context usage while preserving all important information.");
+      await ctx.reply("✅ Demande de compactage envoyée. Le modèle va compresser le contexte.");
+    } catch (err) {
+      await ctx.reply(`❌ ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+}
+
 function abortHandler(
   acp: AcpClient, 
   sm: SessionManager, 
@@ -1049,6 +1096,84 @@ function statusHandler(
   };
 }
 
+function reauthHandler(acpClient: AcpClient) {
+  return async (ctx: Context) => {
+    await ctx.reply("🔑 Lancement de l'authentification Mistral...");
+
+    let signInUrl: string;
+    try {
+      const attempt = await startSignIn();
+      signInUrl = attempt.signInUrl;
+    } catch (err) {
+      await ctx.reply(`❌ Impossible de démarrer l'authentification : ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+
+    await ctx.reply(
+      `🔑 Clique ici pour te reconnecter à Mistral (valide 10 min) :\n${signInUrl}\n\n⚠️ Tu peux aussi coller une clé API existante ici directement.`,
+      { link_preview_options: { is_disabled: true } },
+    );
+
+    pollAndExchange()
+      .then((newKey) => {
+        saveApiKey(newKey);
+        process.env.MISTRAL_API_KEY = newKey;
+        logger.info("[Auth] API key renewed via /reauth");
+        return ctx.reply("✅ Clé API renouvelée ! Redémarrage du service ACP...");
+      })
+      .then(() => {
+        logger.info("[Auth] Restarting ACP with new API key...");
+        acpClient.stop();
+        return new Promise((r) => setTimeout(r, 1000));
+      })
+      .then(() => acpClient.start())
+      .then(() => acpClient.initialize())
+      .then(() => {
+        logger.info("[Auth] ACP restarted with new API key");
+        ctx.reply("✅ Service redémarré avec la nouvelle clé !").catch(() => {});
+      })
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn(`[Auth] /reauth failed: ${msg}`);
+        ctx.reply(
+          `❌ Échec : ${msg}\n\n⚠️ Tu peux obtenir une clé sur https://console.mistral.ai et la coller ici.`,
+        ).catch(() => {});
+      });
+  };
+}
+
+function setkeyHandler(acpClient: AcpClient) {
+  return async (ctx: Context) => {
+    const text = ctx.message?.text?.trim() || '';
+    const key = text.replace('/setkey', '').trim();
+
+    if (!key) {
+      await ctx.reply("Usage: `/setkey <votre_clé_API>`\n\nTu peux obtenir une clé sur https://console.mistral.ai", { parse_mode: "Markdown" });
+      return;
+    }
+
+    await ctx.reply("⏳ Validation de la clé...");
+    try {
+      const valid = await validateApiKey(key);
+      if (!valid) {
+        await ctx.reply("❌ Clé API invalide. Vérifie la clé et réessaie.");
+        return;
+      }
+      saveApiKey(key);
+      process.env.MISTRAL_API_KEY = key;
+      await ctx.reply("✅ Clé API enregistrée ! Redémarrage du service ACP...");
+      logger.info("[Auth] API key updated via /setkey");
+      acpClient.stop();
+      await new Promise((r) => setTimeout(r, 1000));
+      await acpClient.start();
+      await acpClient.initialize();
+      await ctx.reply("✅ Service redémarré avec la nouvelle clé !");
+    } catch (err) {
+      await ctx.reply(`❌ Erreur : ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+}
+
 const helpHandler = async (ctx: Context) => {
   await ctx.reply(
     "🤖 **Vibe Bot**\n\n" +
@@ -1073,6 +1198,9 @@ const helpHandler = async (ctx: Context) => {
     "/todo done <id> - Toggle todo done\n" +
     "/todo rm <id> - Remove a todo\n" +
     "/todo clear - Clear done todos\n\n" +
+    "**Account**\n" +
+    "/reauth - Reconnect Mistral API (if key expired)\n" +
+    "/setkey <key> - Set Mistral API key manually\n\n" +
     "Type any message to send a prompt to Vibe.",
     { parse_mode: "Markdown" },
   );
@@ -1130,6 +1258,7 @@ async function handleAcpNotification(
   onThinkingChunk?: (text: string) => void,
   onUsage?: (usage: { inputTokens: number; outputTokens: number; cost: number }) => void,
   onToolUpdate?: (summary: string) => void,
+  onToolEntry?: (icon: string, label: string) => void,
 ): Promise<void> {
   const m = msg as Record<string, unknown>;
   const method = m.method as string | undefined;
@@ -1232,6 +1361,14 @@ async function handleAcpNotification(
       } else if (!existing) {
         toolCallMap.set(toolCallId, { name: toolName, kind, input: undefined });
         toolCountWrapper.n++;
+      }
+      // Notify tool entry for live streaming
+      if (onToolEntry && input) {
+        const icon = TOOL_EMOJI[kind] || TOOL_EMOJI[toolName] || "🛠️";
+        const fp = (input?.filePath || input?.path || input?.file_path || "") as string;
+        const cmd = (input?.command || input?.code || "") as string;
+        const label = fp ? `${toolName} ${fp.slice(0, 200)}` : cmd ? `${toolName} ${cmd.slice(0, 200)}` : toolName;
+        onToolEntry(icon, label);
       }
       flushProgress();
       if (onToolUpdate) {

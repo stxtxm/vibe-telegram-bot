@@ -52,7 +52,7 @@ describe("ResponseStreamer", () => {
     expect(msgId).toBe(100);
     expect(bot.api.sendMessage).toHaveBeenCalledWith(
       chatId,
-      "⏳ Thinking...",
+      "⏳...",
       expect.objectContaining({ reply_markup: expect.anything() }),
     );
     expect(streamer.isActive).toBe(true);
@@ -63,7 +63,7 @@ describe("ResponseStreamer", () => {
     await streamer.start(1, 42);
     expect(bot.api.sendMessage).toHaveBeenCalledWith(
       chatId,
-      "⏳ Thinking...",
+      "⏳...",
       expect.objectContaining({ reply_to_message_id: 42 }),
     );
   });
@@ -74,11 +74,13 @@ describe("ResponseStreamer", () => {
     expect(msgId).toBe(0);
   });
 
-  it("should accumulate response text", async () => {
+  it("should accumulate response text without sending", async () => {
     await streamer.start(1);
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
     streamer.appendResponse("Hello ");
     streamer.appendResponse("world");
     expect(streamer["state"]?.accumulatedText).toBe("Hello world");
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
   });
 
   it("should accumulate thinking text", async () => {
@@ -89,30 +91,79 @@ describe("ResponseStreamer", () => {
     expect(streamer["state"]?.hasShownThinking).toBe(true);
   });
 
-  it("should build combined text with thinking blockquote", async () => {
+  it("should send thinking as 💭 messages on timer", async () => {
     await streamer.start(1);
-    streamer.appendThinking("Reasoning...");
-    streamer.appendResponse("Answer");
-    const text = streamer["buildCombinedText"]();
-    expect(text).toContain("<blockquote>");
-    expect(text).toContain("Reasoning...");
-    expect(text).toContain("Answer");
+    streamer.appendThinking("Step 1 ");
+    streamer.appendThinking("Step 2 ");
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(600);
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(2);
+    const call = bot.api.sendMessage.mock.calls[1];
+    expect(call[0]).toBe(chatId);
+    expect(call[1]).toBe("💭 Step 1 Step 2 ");
+    expect(call[2]?.parse_mode).toBe("HTML");
   });
 
-  it("should build combined text without thinking", async () => {
+  it("should update progress to 💭 thinking indicator", async () => {
     await streamer.start(1);
-    streamer.appendResponse("Direct answer");
-    const text = streamer["buildCombinedText"]();
-    expect(text).not.toContain("<blockquote>");
-    expect(text).toBe("Direct answer");
+    streamer.appendThinking("thinking...");
+    await vi.advanceTimersByTimeAsync(600);
+    expect(bot.api.editMessageText).toHaveBeenCalledWith(
+      chatId, 100, "💭...", expect.anything(),
+    );
   });
 
-  it("should escape HTML in thinking text", async () => {
+  it("should send tool entry immediately", async () => {
     await streamer.start(1);
-    streamer.appendThinking("<script>alert('xss')</script>");
-    const text = streamer["buildCombinedText"]();
-    expect(text).toContain("&lt;script&gt;");
-    expect(text).not.toContain("<script>");
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
+    streamer.addToolEntry("📖", "read src/index.ts");
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(2);
+    const call = bot.api.sendMessage.mock.calls[1];
+    expect(call[0]).toBe(chatId);
+    expect(call[1]).toBe("📖 read src/index.ts");
+  });
+
+  it("should accumulate multiple tool entries", async () => {
+    await streamer.start(1);
+    streamer.addToolEntry("📖", "read a.ts");
+    streamer.addToolEntry("💻", "ls -la");
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(3);
+    expect(streamer["state"]?.toolEntries).toHaveLength(2);
+  });
+
+  it("should send response text at finalize only", async () => {
+    await streamer.start(1);
+    streamer.appendResponse("Full response content. ");
+    streamer.appendResponse("Sent at the end only.");
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
+    await streamer.finalize("", "5s");
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(3);
+    const resp = bot.api.sendMessage.mock.calls[1];
+    expect(resp[0]).toBe(chatId);
+    expect(resp[1]).toBe("Full response content. Sent at the end only.");
+    expect(resp[2]?.parse_mode).toBe("HTML");
+  });
+
+  it("should escape HTML in response at finalize", async () => {
+    await streamer.start(1);
+    streamer.appendResponse("<script>alert('xss')</script>");
+    await streamer.finalize("", "5s");
+    const resp = bot.api.sendMessage.mock.calls[1];
+    expect(resp[1]).toBe("&lt;script&gt;alert('xss')&lt;/script&gt;");
+    expect(resp[2]?.parse_mode).toBe("HTML");
+  });
+
+  it("should send thinking first then response at finalize", async () => {
+    await streamer.start(1);
+    streamer.appendThinking("Step 1: thinking...");
+    streamer.appendResponse("Final answer here.");
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
+    await streamer.finalize("", "5s");
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(4);
+    const think = bot.api.sendMessage.mock.calls[1];
+    expect(think[1]).toContain("💭");
+    const resp = bot.api.sendMessage.mock.calls[2];
+    expect(resp[1]).toBe("Final answer here.");
   });
 
   it("should set usage data", async () => {
@@ -121,35 +172,12 @@ describe("ResponseStreamer", () => {
     expect(streamer.usage).toEqual({ inputTokens: 100, outputTokens: 50, cost: 0.01 });
   });
 
-  it("should generate different signatures for different text", async () => {
-    await streamer.start(1);
-    const sig1 = streamer["signature"]("hello");
-    const sig2 = streamer["signature"]("world");
-    expect(sig1).not.toBe(sig2);
-  });
-
-  it("should produce same signature for same text", async () => {
-    await streamer.start(1);
-    const sig1 = streamer["signature"]("hello world");
-    const sig2 = streamer["signature"]("hello world");
-    expect(sig1).toBe(sig2);
-  });
-
-  it("should not edit message if signature unchanged", async () => {
-    await streamer.start(1);
-    streamer["state"]!.lastSentSignature = streamer["signature"]("hello");
-    streamer.appendResponse("hello");
-    vi.advanceTimersByTime(1500);
-    await Promise.resolve();
-    expect(bot.api.editMessageText).not.toHaveBeenCalled();
-  });
-
   it("should abort and cleanup", async () => {
     await streamer.start(1);
     streamer.appendResponse("Partial text");
     streamer.abort();
     expect(streamer.isActive).toBe(false);
-    expect(streamer["state"]?.flushTimer).toBeNull();
+    expect(streamer["state"]?.thinkingFlushTimer).toBeNull();
   });
 
   it("should cancel with accumulated text", async () => {
@@ -184,35 +212,54 @@ describe("ResponseStreamer", () => {
     await streamer.finalize("", "5s");
 
     const footerCall = bot.api.sendMessage.mock.calls.find(
-      (c: any[]) => c[0] === chatId && typeof c[1] === "string" && c[1].includes("⏱️")
+      (c: any[]) => c[0] === chatId && typeof c[1] === "string" && (c[1].includes("⏱") || c[1].includes("⏱️"))
     );
     expect(footerCall).toBeDefined();
     expect(footerCall[1]).not.toContain("💰");
   });
 
-  it("should handle message not found error", async () => {
+  it("should not send anything on flushNow when no thinking", async () => {
     await streamer.start(1);
-    streamer["state"]!.lastSentSignature = "old";
-    bot.api.editMessageText = vi.fn().mockRejectedValue(new Error("message to edit not found"));
+    await streamer.flushNow();
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
+  });
 
-    streamer.appendResponse("New text");
-    vi.advanceTimersByTime(1500);
-    await Promise.resolve();
-    await Promise.resolve();
+  it("should flush pending thinking on flushNow", async () => {
+    await streamer.start(1);
+    streamer.appendThinking("Pending thought");
+    await streamer.flushNow();
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(2);
+    const call = bot.api.sendMessage.mock.calls[1];
+    expect(call[1]).toBe("💭 Pending thought");
+  });
 
+  it("should send nothing after finalize when no response", async () => {
+    await streamer.start(1);
+    await streamer.finalize("", "5s");
     expect(bot.api.sendMessage).toHaveBeenCalledTimes(2);
   });
 
-  it("should handle message not modified error", async () => {
+  it("should split long response into multiple messages at finalize", async () => {
     await streamer.start(1);
-    streamer["state"]!.lastFlushTime = 0;
-    bot.api.editMessageText = vi.fn().mockRejectedValue(new Error("message is not modified"));
+    const longText = "a".repeat(5000);
+    streamer.appendResponse(longText);
+    await streamer.finalize("", "5s");
+    expect(bot.api.sendMessage).toHaveBeenCalledTimes(4);
+    const chunk1 = bot.api.sendMessage.mock.calls[1][1];
+    const chunk2 = bot.api.sendMessage.mock.calls[2][1];
+    expect(chunk1 + chunk2).toBe(longText);
+  });
 
-    streamer.appendResponse("Same text");
-    vi.advanceTimersByTime(1500);
-    await Promise.resolve();
+  it("should edit progress to ✅ Done on finalize", async () => {
+    await streamer.start(1);
+    await streamer.finalize("", "5s");
+    expect(bot.api.editMessageText).toHaveBeenCalledWith(chatId, 100, "✅ Done");
+  });
 
-    expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
+  it("should edit progress to ⏹️ on abort", async () => {
+    await streamer.start(1);
+    streamer.abort();
+    expect(bot.api.editMessageText).toHaveBeenCalledWith(chatId, 100, "⏹️ Annulé");
   });
 });
 

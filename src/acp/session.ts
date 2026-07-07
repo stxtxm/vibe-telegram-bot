@@ -34,14 +34,13 @@ export class SessionManager {
 
   private async saveLastSession(): Promise<void> {
     if (!this.currentId) return;
-    const s = this.sessions.get(this.currentId);
-    if (!s) return;
     try {
       await fs.mkdir(DATA_DIR, { recursive: true });
+      const s = this.sessions.get(this.currentId);
       const data: PersistedSession = {
-        sessionId: s.id,
-        cwd: s.cwd,
-        title: s.title,
+        sessionId: this.currentId,
+        cwd: s?.cwd || "",
+        title: s?.title,
       };
       await fs.writeFile(LAST_SESSION_FILE, JSON.stringify(data, null, 2));
     } catch (err) {

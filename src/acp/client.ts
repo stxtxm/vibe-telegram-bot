@@ -28,6 +28,11 @@ export class AcpClient {
   private disconnectHandler: DisconnectHandler | null = null;
   private stderrBuffer = "";
   private stderrLineCount = 0;
+  private _contextChars = 0;
+  private _contextMessages = 0;
+
+  get contextChars(): number { return this._contextChars; }
+  get contextMessages(): number { return this._contextMessages; }
 
   onMessage(h: MessageHandler) { this.msgHandler = h; }
   onDisconnect(h: DisconnectHandler) { this.disconnectHandler = h; }
@@ -68,7 +73,14 @@ export class AcpClient {
         this.stderrLineCount = 30;
       }
       const t = chunk.trim();
-      if (t) logger.debug(`[ACP stderr] ${t}`);
+      if (t) {
+        logger.debug(`[ACP stderr] ${t}`);
+        // Parse context metrics from telemetry
+        const charsMatch = t.match(/nb_context_chars['"}]?\s*[:=]\s*(\d+)/);
+        if (charsMatch) this._contextChars = parseInt(charsMatch[1], 10);
+        const msgMatch = t.match(/nb_context_messages['"}]?\s*[:=]\s*(\d+)/);
+        if (msgMatch) this._contextMessages = parseInt(msgMatch[1], 10);
+      }
     });
 
     await new Promise((r) => setTimeout(r, 1500));

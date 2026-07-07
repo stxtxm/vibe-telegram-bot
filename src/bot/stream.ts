@@ -1,8 +1,8 @@
 import { type Bot, type Context, InlineKeyboard } from "grammy";
 import { logger } from "../utils/logger.js";
 
-const THROTTLE_MS = 1_000;
 const TEXT_LIMIT = 3_800;
+const THINKING_FLUSH_MS = 600;
 
 interface UsageData {
   inputTokens: number;
@@ -10,17 +10,22 @@ interface UsageData {
   cost: number;
 }
 
+interface ToolEntry {
+  icon: string;
+  label: string;
+}
+
 interface StreamState {
   chatId: number;
   generation: number;
-  streamMessageId: number | null;
-  accumulatedText: string;
+  progressMessageId: number | null;
   thinkingText: string;
+  thinkingLastSentLength: number;
+  accumulatedText: string;
+  toolEntries: ToolEntry[];
   hasShownThinking: boolean;
-  toolSummaryText: string;
-  lastSentSignature: string | null;
-  flushTimer: ReturnType<typeof setTimeout> | null;
-  lastFlushTime: number;
+  thinkingFlushTimer: ReturnType<typeof setTimeout> | null;
+  lastSentLength: number;
   usage: UsageData | null;
   isActive: boolean;
 }
@@ -29,50 +34,51 @@ export class ResponseStreamer {
   private bot: Bot<Context>;
   private chatId: number;
   private state: StreamState | null = null;
+  private taskQ: Promise<void> = Promise.resolve();
 
   constructor(bot: Bot<Context>, chatId: number) {
     this.bot = bot;
     this.chatId = chatId;
   }
 
+  private enqueue<T>(fn: () => Promise<T>): Promise<T> {
+    const p = this.taskQ.then(fn, fn);
+    this.taskQ = p.then(() => {}, () => {});
+    return p;
+  }
+
   start(generation: number, replyToMessageId?: number): Promise<number> {
     this.state = {
       chatId: this.chatId,
       generation,
-      streamMessageId: null,
-      accumulatedText: "",
+      progressMessageId: null,
       thinkingText: "",
+      thinkingLastSentLength: 0,
+      accumulatedText: "",
+      toolEntries: [],
       hasShownThinking: false,
-      toolSummaryText: "",
-      lastSentSignature: null,
-      flushTimer: null,
-      lastFlushTime: 0,
+      thinkingFlushTimer: null,
+      lastSentLength: 0,
       usage: null,
       isActive: true,
     };
-
     const abortKb = new InlineKeyboard().text("Abort", `abort:${generation}`);
     const extra: Record<string, unknown> = { reply_markup: abortKb };
     if (replyToMessageId) {
       extra.reply_to_message_id = replyToMessageId;
     }
-
-    return this.sendInitialMessage(extra);
+    return this.sendProgressMessage(extra);
   }
 
-  private async sendInitialMessage(extra: Record<string, unknown>): Promise<number> {
+  private async sendProgressMessage(extra: Record<string, unknown>): Promise<number> {
     try {
-      const msg = await this.bot.api.sendMessage(this.chatId, "⏳ Thinking...", extra as never);
-      if (this.state) this.state.streamMessageId = msg.message_id;
+      const msg = await this.bot.api.sendMessage(this.chatId, "⏳...", extra as never);
+      if (this.state) this.state.progressMessageId = msg.message_id;
       return msg.message_id;
     } catch (err) {
-      logger.warn("[Stream] Failed to send initial message:", err);
+      logger.warn("[Stream] Failed to send progress message:", err);
       return 0;
     }
-  }
-
-  get streamMessageId(): number | null {
-    return this.state?.streamMessageId ?? null;
   }
 
   get isActive(): boolean {
@@ -87,18 +93,65 @@ export class ResponseStreamer {
     return this.state?.usage ?? null;
   }
 
+  get progressMessageId(): number | null {
+    return this.state?.progressMessageId ?? null;
+  }
+
   appendResponse(text: string): void {
-    if (!this.state?.isActive) { logger.debug("[Stream] appendResponse skipped: inactive"); return; }
+    if (!this.state?.isActive) return;
     this.state.accumulatedText += text;
-    logger.debug(`[Stream] appendResponse: +${text.length} chars, total=${this.state.accumulatedText.length}`);
-    this.scheduleFlush(false);
   }
 
   appendThinking(text: string): void {
     if (!this.state?.isActive) return;
     this.state.thinkingText += text;
     this.state.hasShownThinking = true;
-    this.scheduleFlush(false);
+    this.scheduleThinkingFlush();
+  }
+
+  addToolEntry(icon: string, label: string): void {
+    if (!this.state?.isActive) return;
+    this.state.toolEntries.push({ icon, label });
+    const msg = `${icon} ${label}`;
+    this.bot.api.sendMessage(this.chatId, msg).catch(() => {});
+  }
+
+  private scheduleThinkingFlush(): void {
+    const s = this.state;
+    if (!s) return;
+    if (s.thinkingFlushTimer) {
+      clearTimeout(s.thinkingFlushTimer);
+    }
+    s.thinkingFlushTimer = setTimeout(() => {
+      if (this.state?.isActive) {
+        this.flushThinking().catch(() => {});
+      }
+    }, THINKING_FLUSH_MS);
+  }
+
+  private async flushThinking(): Promise<void> {
+    return this.enqueue(async () => {
+      const s = this.state;
+      if (!s || !s.isActive) return;
+      if (s.thinkingText.length <= s.thinkingLastSentLength) return;
+
+      const newText = s.thinkingText.slice(s.thinkingLastSentLength);
+      s.thinkingLastSentLength = s.thinkingText.length;
+
+      if (!newText) return;
+
+      const escaped = escapeHtml(newText);
+      const chunks = chunkText(escaped, TEXT_LIMIT);
+      for (const chunk of chunks) {
+        await this.sendHtml(`💭 ${chunk}`);
+      }
+
+      if (s.progressMessageId) {
+        this.bot.api.editMessageText(s.chatId, s.progressMessageId, "💭...", {
+          reply_markup: new InlineKeyboard().text("Abort", `abort:${s.generation}`),
+        }).catch(() => {});
+      }
+    });
   }
 
   setUsage(usage: UsageData): void {
@@ -106,258 +159,78 @@ export class ResponseStreamer {
     this.state.usage = usage;
   }
 
-  setToolSummary(text: string): void {
-    if (!this.state?.isActive) return;
-    if (this.state.toolSummaryText === text) return;
-    this.state.toolSummaryText = text;
-    this.scheduleFlush(false);
+  setToolSummary(_text: string): void {
+    // Now shown in footer only
   }
 
-  private scheduleFlush(isFinal: boolean): void {
-    if (!this.state) return;
-    if (this.state.flushTimer) {
-      clearTimeout(this.state.flushTimer);
-      this.state.flushTimer = null;
-    }
-    if (isFinal) {
-      this.flushState(true).catch(() => {});
-    } else {
-      this.state.flushTimer = setTimeout(() => {
-        if (this.state?.isActive) {
-          this.flushState(false).catch(() => {});
-        }
-      }, THROTTLE_MS);
-    }
-  }
-
-  flushNow(): Promise<void> {
-    if (!this.state) return Promise.resolve();
-    if (this.state.flushTimer) {
-      clearTimeout(this.state.flushTimer);
-      this.state.flushTimer = null;
-    }
-    return this.flushState(false);
-  }
-
-  private async flushState(isFinal: boolean): Promise<void> {
-    const s = this.state;
-    if (!s || !s.isActive) { logger.debug("[Stream] flushState: inactive"); return; }
-
-    const text = this.buildCombinedText();
-    if (!text && !isFinal) {
-      logger.debug("[Stream] flushState: no text, not final");
-      return;
-    }
-
-    // Truncate for editMessageText (Telegram 4096 limit), preserving HTML tag integrity
-    const displayText = text.length > TEXT_LIMIT ? this.truncateHtml(text, TEXT_LIMIT) : text;
-
-    const sig = this.signature(displayText);
-    if (!isFinal && sig === s.lastSentSignature) return;
-
-    const now = Date.now();
-    if (!isFinal && now - s.lastFlushTime < THROTTLE_MS) {
-      this.scheduleFlush(false);
-      return;
-    }
-    s.lastFlushTime = now;
-
-    const chatId = s.chatId;
-    const msgId = s.streamMessageId;
-
-    if (msgId !== null) {
-      try {
-        await this.bot.api.editMessageText(chatId, msgId, displayText || "⏳ Thinking...", { parse_mode: "HTML" } as never);
-        s.lastSentSignature = sig;
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (msg.includes("message is not modified")) {
-          return;
-        }
-        if (msg.includes("message to edit not found") || msg.includes("message not found")) {
-          s.streamMessageId = null;
-          await this.sendFreshMessage(displayText, s);
-          return;
-        }
-        logger.warn("[Stream] editMessageText error:", msg);
-      }
-    } else {
-      await this.sendFreshMessage(displayText, s);
-    }
-  }
-
-  private async sendFreshMessage(text: string, s: StreamState): Promise<void> {
-    // Also cap fresh messages to TEXT_LIMIT, preserving HTML tag integrity
-    const displayText = text.length > TEXT_LIMIT ? this.truncateHtml(text, TEXT_LIMIT) : text;
-    try {
-      const msg = await this.bot.api.sendMessage(s.chatId, displayText || "⏳ Thinking...", { parse_mode: "HTML" } as never);
-      s.streamMessageId = msg.message_id;
-      s.lastSentSignature = this.signature(displayText);
-    } catch (err) {
-      try {
-        const msg = await this.bot.api.sendMessage(s.chatId, displayText || "⏳ Thinking...");
-        s.streamMessageId = msg.message_id;
-        s.lastSentSignature = this.signature(displayText);
-      } catch (e2) {
-        logger.warn("[Stream] Failed to send fresh message:", e2);
-      }
-    }
-  }
-
-  private buildCombinedText(): string {
-    if (!this.state) return "";
-    const { hasShownThinking, thinkingText, toolSummaryText, accumulatedText } = this.state;
-    let text = "";
-    if (hasShownThinking && thinkingText) {
-      const escaped = this.escapeHtml(thinkingText);
-      text += `<blockquote>${escaped}</blockquote>\n\n`;
-    }
-    if (toolSummaryText) {
-      text += `${toolSummaryText}\n\n`;
-    }
-    if (accumulatedText) {
-      text += this.escapeHtml(accumulatedText);
-    }
-    return text;
-  }
-
-  private truncateHtml(text: string, max: number): string {
-    if (text.length <= max) return text;
-    const truncated = text.slice(0, max);
-    // Close any unclosed HTML tags in the truncated text
-    const tagStack: string[] = [];
-    const tagRe = /<\/?([a-zA-Z]+)[^>]*>/g;
-    let match: RegExpExecArray | null;
-    while ((match = tagRe.exec(truncated))) {
-      if (match[0].startsWith("</")) {
-        if (tagStack.length > 0) tagStack.pop();
-      } else if (!match[0].endsWith("/>")) {
-        if (!match[1].startsWith("/")) tagStack.push(match[1]);
-      }
-    }
-    // Append closing tags in reverse order
-    let result = truncated;
-    for (let i = tagStack.length - 1; i >= 0; i--) {
-      result += `</${tagStack[i]}>`;
-    }
-    return result + "…";
-  }
-
-  private signature(text: string): string {
-    let hash = 0;
-    for (let i = 0; i < text.length; i++) {
-      const char = text.charCodeAt(i);
-      hash = ((hash << 5) - hash) + char;
-      hash = hash & hash;
-    }
-    return hash.toString(36);
-  }
-
-  private escapeHtml(text: string): string {
-    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  setProgressDone(): void {
+    // No-op
   }
 
   async finalize(toolSummary: string, duration: string): Promise<void> {
     const s = this.state;
     if (!s) { logger.debug("[Stream] finalize: no state"); return; }
-    logger.debug(`[Stream] finalize: acc=${s.accumulatedText.length} chars, thinking=${s.thinkingText.length}, msgId=${s.streamMessageId}`);
+    logger.debug(`[Stream] finalize: acc=${s.accumulatedText.length} chars, thinking=${s.thinkingText.length}`);
 
-    this.cancelTimer();
-    await this.flushState(true);
+    this.cancelTimers();
 
-    // If response was truncated, send the full text as a separate message
-    const rawLen = (s.accumulatedText || "").length;
-    if (rawLen > TEXT_LIMIT) {
-      logger.debug("[Stream] sending full response as separate messages");
-      this.sendFullResponse(s).catch(() => {});
-    }
+    await this.enqueue(async () => {
+      if (!this.state?.isActive) return;
 
-    // Append footer to the stream message (keep the response text visible)
-    await this.appendFooter(toolSummary, duration);
-
-    this.cleanup();
-  }
-
-  private async sendFullResponse(s: StreamState): Promise<void> {
-    const chunks = splitMessage(s.accumulatedText, TEXT_LIMIT);
-    for (const chunk of chunks) {
-      const escaped = this.escapeHtml(chunk);
-      try {
-        await this.bot.api.sendMessage(s.chatId, escaped, { parse_mode: "HTML" } as never);
-      } catch {
-        try { await this.bot.api.sendMessage(s.chatId, chunk); } catch { /* ignore */ }
-      }
-    }
-  }
-
-  private async appendFooter(toolSummary: string, duration: string): Promise<void> {
-    const s = this.state;
-    if (!s) return;
-
-    let footer = "";
-    if (s.usage) {
-      footer = `⏱️ ${duration}  🤖 ${s.usage.inputTokens}→${s.usage.outputTokens} tok`;
-      if (s.usage.cost > 0) {
-        footer += `  💰 $${s.usage.cost.toFixed(4)}`;
-      }
-    } else {
-      footer = `⏱️ ${duration}`;
-    }
-    if (toolSummary) {
-      footer = `⚙️ ${toolSummary}\n` + footer;
-    }
-
-    if (s.streamMessageId) {
-      const existing = this.buildCombinedText();
-      if (existing) {
-        const sep = `\n\n━━━━━━━━━━━━━━━━━━\n`;
-        const updated = existing + sep + footer;
-        // Only edit if it fits within limit
-        if (updated.length <= TEXT_LIMIT) {
-          try {
-            await this.bot.api.editMessageText(s.chatId, s.streamMessageId, updated, { parse_mode: "HTML" } as never);
-            s.streamMessageId = null;
-            return;
-          } catch {
-            // Fall through to send separate message
+      // Flush remaining thinking
+      if (this.state.thinkingText.length > this.state.thinkingLastSentLength) {
+        const newText = this.state.thinkingText.slice(this.state.thinkingLastSentLength);
+        this.state.thinkingLastSentLength = this.state.thinkingText.length;
+        if (newText) {
+          const escaped = escapeHtml(newText);
+          const chunks = chunkText(escaped, TEXT_LIMIT);
+          for (const chunk of chunks) {
+            await this.sendHtml(`💭 ${chunk}`);
           }
         }
       }
-    }
 
-    // Fallback: send the actual response text + footer as a new message
-    const body = this.buildCombinedText();
-    if (body) {
-      const sep = `\n\n━━━━━━━━━━━━━━━━━━\n`;
-      const payload = body + sep + footer;
-      if (payload.length <= TEXT_LIMIT) {
-        try {
-          await this.bot.api.sendMessage(s.chatId, payload, { parse_mode: "HTML" } as never);
-          return;
-        } catch {
-          // try plain text
+      // Flush all accumulated response
+      if (this.state.accumulatedText.length > 0) {
+        const escaped = escapeHtml(this.state.accumulatedText);
+        const chunks = chunkText(escaped, TEXT_LIMIT);
+        for (const chunk of chunks) {
+          await this.sendHtml(chunk);
         }
+      }
+
+      // Update progress to Done
+      if (this.state.progressMessageId) {
         try {
-          await this.bot.api.sendMessage(s.chatId, s.accumulatedText || "✅ Done");
-          return;
-        } catch { /* ignore */ }
-      } else {
-        // Too long — send truncated HTML version
-        const truncated = this.truncateHtml(body, TEXT_LIMIT - sep.length - footer.length - 3) + sep + footer;
-        try {
-          await this.bot.api.sendMessage(s.chatId, truncated, { parse_mode: "HTML" } as never);
-          return;
+          await this.bot.api.editMessageText(this.chatId, this.state.progressMessageId, "✅ Done");
         } catch { /* ignore */ }
       }
+
+      // Send footer
+      this.appendFooter(toolSummary, duration);
+      this.cleanup();
+    });
+  }
+
+  private appendFooter(toolSummary: string, duration: string): void {
+    const s = this.state;
+    if (!s) return;
+
+    const stats: string[] = [];
+    if (s.usage) {
+      stats.push(`🤖 ${s.usage.inputTokens}→${s.usage.outputTokens}`);
+      if (s.usage.cost > 0) {
+        stats.push(`💰 $${s.usage.cost.toFixed(4)}`);
+      }
+    }
+    stats.push(`⏱ ${duration}`);
+    let footer = stats.join(" · ");
+
+    if (toolSummary) {
+      footer = `⚙️ ${toolSummary}\n\n` + footer;
     }
 
-    // Absolute fallback: just the footer
-    try {
-      const fallbackText = `✅ **Done**\n${footer}`;
-      await this.bot.api.sendMessage(s.chatId, fallbackText, { parse_mode: "Markdown" } as never);
-    } catch {
-      try { await this.bot.api.sendMessage(s.chatId, footer); } catch { /* ignore */ }
-    }
+    this.bot.api.sendMessage(this.chatId, footer).catch(() => {});
   }
 
   cancelWithAccumulated(): Promise<void> {
@@ -367,23 +240,70 @@ export class ResponseStreamer {
   abort(): void {
     const s = this.state;
     if (!s) return;
-    this.cancelTimer();
+    this.cancelTimers();
+    if (s.progressMessageId) {
+      this.bot.api.editMessageText(s.chatId, s.progressMessageId, "⏹️ Annulé").catch(() => {});
+    }
     this.cleanup();
   }
 
-  private cancelTimer(): void {
-    if (this.state?.flushTimer) {
-      clearTimeout(this.state.flushTimer);
-      this.state.flushTimer = null;
+  flushNow(): Promise<void> {
+    if (!this.state) return Promise.resolve();
+    this.cancelTimers();
+    if (this.state.thinkingText.length > this.state.thinkingLastSentLength) {
+      return this.flushThinking();
+    }
+    return Promise.resolve();
+  }
+
+  private cancelTimers(): void {
+    if (this.state?.thinkingFlushTimer) {
+      clearTimeout(this.state.thinkingFlushTimer);
+      this.state.thinkingFlushTimer = null;
     }
   }
 
   private cleanup(): void {
     if (this.state) {
       this.state.isActive = false;
-      this.state.streamMessageId = null;
     }
   }
+
+  private async sendHtml(text: string): Promise<number | null> {
+    try {
+      const msg = await this.bot.api.sendMessage(this.chatId, text, { parse_mode: "HTML" } as never);
+      return msg.message_id;
+    } catch {
+      try {
+        const msg = await this.bot.api.sendMessage(this.chatId, text);
+        return msg.message_id;
+      } catch { /* ignore */ }
+    }
+    return null;
+  }
+}
+
+export function chunkText(text: string, limit: number): string[] {
+  if (!text) return [];
+  if (text.length <= limit) return [text];
+  const chunks: string[] = [];
+  let start = 0;
+  while (start < text.length) {
+    if (start + limit >= text.length) {
+      chunks.push(text.slice(start));
+      break;
+    }
+    const end = start + limit;
+    const nl = text.lastIndexOf("\n", end);
+    if (nl > start && end - nl < 1000) {
+      chunks.push(text.slice(start, nl + 1));
+      start = nl + 1;
+    } else {
+      chunks.push(text.slice(start, end));
+      start = end;
+    }
+  }
+  return chunks;
 }
 
 export function splitMessage(text: string, max = 4096): string[] {

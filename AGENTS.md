@@ -36,8 +36,12 @@ Mistral Vibe CLI
 | `src/bot/menus.ts` | UI menus | Inline keyboard builders |
 | `src/acp/client.ts` | ACP client | `AcpClient` class, JSON-RPC |
 | `src/acp/session.ts` | Session management | `SessionManager` class |
+| `src/acp/auth.ts` | API key auth | `validateApiKey()`, `saveApiKey()`, `startSignIn()` |
 | `src/acp/protocol.ts` | Protocol types | TypeScript interfaces |
 | `src/todo.ts` | Todo management | `TodoManager` class |
+| `restart.sh` | Safe restart script | Wrapper for `systemd` restart |
+| `scripts/auth_start.py` | PKCE OAuth start | Generates sign-in URL |
+| `scripts/auth_complete.py` | OAuth polling | Exchanges code for token |
 
 ### Command Flow
 
@@ -219,6 +223,41 @@ bot.on("callback_query:data", async (ctx) => {
 });
 ```
 
+### API Key Management
+
+The bot uses a Mistral API key stored in `~/.vibe/.env` as `MISTRAL_API_KEY`.
+
+**Ways to change the key:**
+
+| Method | How | When to use |
+|--------|-----|-------------|
+| `/setkey <key>` | Bot command | User wants to paste a known key |
+| Paste raw key | Text message matching `^[A-Za-z0-9_-]{20,50}$` | Quick paste in chat |
+| `/reauth` | OAuth PKCE flow (browser) | No key available, needs login |
+
+All three methods restart **only** the ACP client (vibe-acp) — the Telegram bot process stays alive. This is safe and does not affect other bots.
+
+To set a key manually (by an agent, not the user):
+```bash
+printf "MISTRAL_API_KEY='<your-key>'\n" > ~/.vibe/.env
+```
+
+Then restart via `./restart.sh` (see Process Safety section).
+
+**Validation**: Keys are validated against `api.mistral.ai/v1/models` (HTTP 200 = valid).
+
+### Pinned Message Behavior
+
+The bot maintains a status message in the chat showing:
+- Session title, model, mode, thinking budget
+- Current working directory
+- Token usage and cost
+- Context size (chars/messages)
+- Tool call count and changed files
+- Busy/idle status
+
+The message is **not pinned** (fixed 2026-07-07). It's sent as a regular message and updated in-place via `editMessageText`. If the message is deleted, a new one is created on the next status update.
+
 ### Important Considerations
 
 1. **Single User**: The bot is designed for a single user (specified by `TELEGRAM_ALLOWED_USER_ID`)
@@ -243,22 +282,35 @@ This project shares the server with other Telegram bots:
 
 1. **Never use `pkill`, `killall`, or any broad process matching.** These will kill other bots. All bots run as `node dist/index.js` — matching by process name is unsafe.
 
-2. **Always stop/restart using the PID lock file:**
+2. **Always use `./restart.sh` to restart the bot.** This script:
+   - Reads the correct PID from `/tmp/vibe-telegram-bot.pid`
+   - Falls back to scanning `/proc/` by cwd + exe (safe, not by name)
+   - Snapshot-checks co-bots before and after to verify they survive
+   - Waits for systemd to auto-restart the service
+   - Supports `--build` (build + restart) and `--hard` (SIGKILL if stuck)
+
    ```bash
-   kill $(cat /tmp/vibe-telegram-bot.pid)
-   ```
-   To verify the lock file exists:
-   ```bash
-   cat /tmp/vibe-telegram-bot.pid
+   # Normal restart
+   ./restart.sh
+
+   # Build and restart
+   ./restart.sh --build
+
+   # Force kill (only if stuck)
+   ./restart.sh --hard
    ```
 
-3. **The PID lock mechanism** (`/tmp/vibe-telegram-bot.pid`):
+3. **Never use `/tmp/vibe.pid` — always use `/tmp/vibe-telegram-bot.pid`.** The correct lock file is `/tmp/vibe-telegram-bot.pid`. Other PID files with different names may be stale or point to the wrong process.
+
+4. **The PID lock mechanism** (`/tmp/vibe-telegram-bot.pid`):
    - Written at startup in `src/index.ts:checkLock()`
    - If another instance with the same PID file is alive, the new instance exits immediately
    - Cleaned up on `SIGINT`, `SIGTERM`, `exit`, and fatal errors
    - Stale locks (PID no longer alive) are detected and overwritten
 
-4. **Do NOT edit files outside this project directory** (`/home/timo/dev/telegram-bots/vibe-telegram-bot/`). The other bot directories belong to separate projects with different architectures.
+5. **Do NOT edit files outside this project directory** (`/home/timo/dev/telegram-bots/vibe-telegram-bot/`). The other bot directories belong to separate projects with different architectures.
+
+6. **Changing the API key should be done from the bot (not by killing processes).** Use `/setkey <key>` in the vibe bot's Telegram chat. This only restarts the ACP client — the bot process stays alive and co-bots are unaffected. If you must restart the whole process, use `./restart.sh`.
 
 ### Debugging Tips
 
@@ -331,5 +383,5 @@ rm -rf dist node_modules
 
 ---
 
-**Last Updated**: 2026-06-25
+**Last Updated**: 2026-07-07
 **Project Version**: 0.1.0
