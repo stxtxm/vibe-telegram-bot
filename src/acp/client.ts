@@ -266,10 +266,13 @@ export class AcpClient {
     logger.info("[ACP] stop");
     if (skipAutoRestart) this._skipNextAutoRestart = true;
     this.rejectAllPending(new Error("ACP client stopped"));
-    this.proc?.kill("SIGTERM");
-    setTimeout(() => { if (this.proc && !this.proc.killed) this.proc?.kill("SIGKILL"); }, 3000);
+    const oldProc = this.proc;
+    oldProc?.kill("SIGTERM");
     this.rl?.close();
     this.proc = null;
     this.rl = null;
+    if (oldProc) {
+      setTimeout(() => { if (!oldProc.killed) oldProc.kill("SIGKILL"); }, 3000);
+    }
   }
 }

@@ -383,5 +383,14 @@ rm -rf dist node_modules
 
 ---
 
-**Last Updated**: 2026-07-07
+**Last Updated**: 2026-07-08
+
+### Session Summary (2026-07-08)
+
+**Problem**: API key `V1jt1KzN7bMaMlKExFk6OC3PMalQQ4V6` was valid at startup (HTTP 200) but Mistral returned 401 transiently at 22:08:35. The bot's auth error handler called `validateApiKey()` which ALSO hit the same transient Mistral API failure → bot declared key permanently invalid. The key was fine the whole time.
+
+**Fix**: Auth error handler (`src/bot/index.ts:509`) now restarts ACP and retries the prompt instead of validating the key first. Key re-validation can fail during Mistral API hiccups, falsely confirming the key is bad. New flow:
+1. ACP reports auth error → bot restarts ACP (reloads key from `~/.vibe/.env`) → retries once
+2. If retry also fails auth → show permanent "❌" error
+3. Also checks `stderr` for "Invalid API key" (ACP's stderr sometimes has auth keywords that the JSON-RPC error message lacks)
 **Project Version**: 0.1.0

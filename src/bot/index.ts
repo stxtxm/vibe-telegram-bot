@@ -506,10 +506,35 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
       const stderr = acpClient.getRecentStderr?.() || "";
       if (stderr) logger.warn("[Bot] ACP stderr during error:\n" + stderr.slice(-1000));
 
-      // Check auth FIRST — not retryable, immediate user-facing message
-      const isAuthError = msg.toLowerCase().includes("invalid key") || msg.toLowerCase().includes("invalid api") || msg.toLowerCase().includes("authorization") || msg.toLowerCase().includes("401") || msg.toLowerCase().includes("unauthorized") || msg.toLowerCase().includes("forbidden");
+      // Auth error — restart ACP + retry before declaring permanent
+      const isAuthError = msg.toLowerCase().includes("invalid key") || msg.toLowerCase().includes("invalid api") || msg.toLowerCase().includes("authorization") || msg.toLowerCase().includes("401") || msg.toLowerCase().includes("unauthorized") || msg.toLowerCase().includes("forbidden") || stderr.toLowerCase().includes("invalid key");
       if (isAuthError) {
-        logger.error("[Bot] Auth error:", msg);
+        if (retry < MAX_PROMPT_RETRIES) {
+          logger.warn("[Bot] Auth error — restarting ACP and retrying");
+          responseStreamer.abort();
+          progressText = "";
+          toolCallMap = new Map();
+          changedFiles.clear();
+          await responseStreamer.start(generation, ctx.message.message_id);
+          await ctx.reply(`🔄 **Erreur d'authentification** — redémarrage ACP et nouvelle tentative... (tentative ${retry + 1}/${MAX_PROMPT_RETRIES})`);
+          await new Promise(r => setTimeout(r, 500));
+          const restartOk = await restartAcp(acpClient, sessionManager);
+          if (!restartOk) {
+            logger.error("[Bot] Auth error — ACP restart failed");
+            await ctx.reply(
+              "❌ Erreur d'authentification — échec du redémarrage ACP.\n\n" +
+              "Crée une nouvelle clé : https://console.mistral.ai\n" +
+              "Puis `/setkey <ta_clé>`",
+              { parse_mode: "Markdown" },
+            );
+            return;
+          }
+          recovered = true;
+          effectiveText = `[retry after auth error]\n\n${effectiveText}`;
+          await runPrompt(acpClient, ctx, sid, generation, stopTyping, retry + 1);
+          return;
+        }
+        logger.error("[Bot] Auth error — permanent after retry:", msg);
         await ctx.reply(
           "❌ Erreur d'authentification.\n\n" +
           "Crée une nouvelle clé : https://console.mistral.ai\n" +
@@ -537,10 +562,10 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
       }
 
       // Session not found — try to reload from disk, then create new if that fails
+      const recoveryCwd = sessionManager.current?.cwd || config.vibe.projectDir;
       if (msg.includes("Session not found")) {
-        const lastCwd = sessionManager.current?.cwd || config.vibe.projectDir;
         try {
-          await sessionManager.loadSession(sid, lastCwd);
+          await sessionManager.loadSession(sid, recoveryCwd);
           // The loadSession may replay old agent_message_chunk notifications into
           // the streamer — kill the stale stream and start fresh for the retry
           responseStreamer.abort();
@@ -556,7 +581,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
           logger.warn(`[Bot] Session ${sid.slice(0, 8)}... load failed, creating new:`, loadErr);
         }
         try {
-          const newSid = await sessionManager.createSession(lastCwd);
+          const newSid = await sessionManager.createSession(recoveryCwd);
           responseStreamer.abort();
           progressText = "";
           toolCallMap = new Map();
@@ -568,11 +593,58 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
           return;
         } catch (createErr) {
           logger.error("[Bot] Session recovery failed:", createErr);
-          await ctx.reply("❌ Session expirée et impossible d'en créer une nouvelle");
+        }
+        // Dernier recours : restart ACP + retry
+        if (retry === 0) {
+          logger.warn("[Bot] Recovery failed, restarting ACP as last resort");
+          await ctx.reply("🔄 Réparation automatique...");
+          responseStreamer.abort();
+          progressText = "";
+          toolCallMap = new Map();
+          changedFiles.clear();
+          await responseStreamer.start(generation, ctx.message.message_id);
+          acpClient.stop(true);
+          await sleep(1000);
+          try {
+            await acpClient.start();
+            await acpClient.initialize();
+            const newSid = await sessionManager.createSession(recoveryCwd);
+            recovered = true;
+            await runPrompt(acpClient, ctx, newSid, generation, stopTyping, retry + 1);
+            return;
+          } catch (restartErr) {
+            logger.error("[Bot] ACP restart recovery also failed:", restartErr);
+            await ctx.reply("❌ Réparation impossible. Essaie /start pour créer une nouvelle session.");
+          }
+        } else {
+          await ctx.reply("❌ Session expirée et impossible d'en créer une nouvelle. Essaie /start.");
         }
       } else {
         logger.error("[Bot] Prompt error:", msg);
-        await ctx.reply(`❌ ${msg}`);
+        if (retry === 0) {
+          logger.warn("[Bot] Restarting ACP as last resort after error:", msg);
+          await ctx.reply("🔄 Réparation automatique...");
+          responseStreamer.abort();
+          progressText = "";
+          toolCallMap = new Map();
+          changedFiles.clear();
+          await responseStreamer.start(generation, ctx.message.message_id);
+          acpClient.stop(true);
+          await sleep(1000);
+          try {
+            await acpClient.start();
+            await acpClient.initialize();
+            const newSid = await sessionManager.createSession(recoveryCwd);
+            recovered = true;
+            await runPrompt(acpClient, ctx, newSid, generation, stopTyping, retry + 1);
+            return;
+          } catch (restartErr) {
+            logger.error("[Bot] ACP restart recovery failed for non-session error:", restartErr);
+            await ctx.reply(`❌ Réparation impossible. Essaie /start.\n\n${msg}`);
+          }
+        } else {
+          await ctx.reply(`❌ ${msg}`);
+        }
       }
     } finally {
       stopTyping?.();
@@ -737,7 +809,8 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
       const s = sessionManager.getSession(selectSid);
       try {
         if (s) {
-          sessionManager.currentSessionId = selectSid;
+          const cwd = s.cwd || config.vibe.projectDir;
+          await sessionManager.loadSession(selectSid, cwd);
           const title = s.title || selectSid.slice(0, 8);
           await ctx.editMessageText(`✅ Switched to session \`${title}\``, { parse_mode: "Markdown" });
           updatePinnedMessage();
@@ -745,7 +818,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
           await ctx.editMessageText("Session not found locally. Use /start to create a new one.");
         }
       } catch (err) {
-        await ctx.editMessageText(`❌ ${err}`).catch(() => {});
+        await ctx.editMessageText(`❌ Erreur : la session est introuvable sur le serveur`).catch(() => {});
       }
       return;
     }
