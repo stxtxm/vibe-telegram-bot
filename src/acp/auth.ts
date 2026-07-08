@@ -25,7 +25,7 @@ export function loadApiKey(): string | null {
   }
 }
 
-export async function validateApiKey(key: string): Promise<boolean> {
+export async function validateApiKey(key: string): Promise<boolean | null> {
   try {
     const res = await fetch(`${MISTRAL_API}/models`, {
       headers: { Authorization: `Bearer ${key}` },
@@ -33,7 +33,7 @@ export async function validateApiKey(key: string): Promise<boolean> {
     });
     return res.ok;
   } catch {
-    return false;
+    return null;
   }
 }
 

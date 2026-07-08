@@ -48,9 +48,17 @@ async function ensureValidApiKey(
   onKeyRenewed?: () => void,
 ): Promise<boolean> {
   const key = loadApiKey();
-  if (key && (await validateApiKey(key))) {
-    logger.info("[Auth] API key is valid");
-    return true;
+  if (key) {
+    const result = await validateApiKey(key);
+    if (result === true) {
+      logger.info("[Auth] API key is valid");
+      return true;
+    }
+    if (result === null) {
+      logger.warn("[Auth] API key validation skipped (network), proceeding");
+      return true;
+    }
+    logger.warn("[Auth] API key is invalid (rejected by server)");
   }
 
   logger.warn("[Auth] API key missing or invalid, starting sign-in flow...");
@@ -127,6 +135,19 @@ async function main(): Promise<void> {
       await acpClient.start();
       await acpClient.initialize();
       logger.info("[ACP] Reconnected successfully");
+
+      // Reload current session on the new ACP server
+      const sid = sessionManager.currentSessionId;
+      if (sid) {
+        const cwd = sessionManager.current?.cwd || config.vibe.projectDir;
+        try {
+          await sessionManager.loadSession(sid, cwd);
+          logger.info(`[Session] Reloaded after reconnect: ${sid.slice(0, 8)}...`);
+        } catch {
+          logger.warn(`[Session] Reload failed after reconnect, creating new`);
+          await sessionManager.createSession(cwd);
+        }
+      }
     } catch (err) {
       logger.error("[ACP] Reconnection failed:", err);
     }
@@ -136,7 +157,7 @@ async function main(): Promise<void> {
     // Key was renewed in background — restart ACP to pick it up
     if (!shuttingDown) {
       logger.info("[Auth] Restarting ACP with new API key...");
-      acpClient.stop();
+      acpClient.stop(true);
       await new Promise((r) => setTimeout(r, 1000));
       try {
         await acpClient.start();

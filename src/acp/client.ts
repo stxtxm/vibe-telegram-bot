@@ -30,6 +30,8 @@ export class AcpClient {
   private stderrLineCount = 0;
   private _contextChars = 0;
   private _contextMessages = 0;
+  private _skipNextAutoRestart = false;
+  private _initialized = false;
 
   get contextChars(): number { return this._contextChars; }
   get contextMessages(): number { return this._contextMessages; }
@@ -38,6 +40,10 @@ export class AcpClient {
   onDisconnect(h: DisconnectHandler) { this.disconnectHandler = h; }
 
   async start(): Promise<void> {
+    // Clear stale stderr from previous ACP instance
+    this.stderrBuffer = "";
+    this.stderrLineCount = 0;
+    this._initialized = false;
     logger.info("[ACP] Starting vibe-acp...");
     const bin = process.env.VIBE_PATH || ".venv/bin/vibe-acp";
     const cwd = process.env.VIBE_CWD || process.cwd();
@@ -56,7 +62,8 @@ export class AcpClient {
     this.proc.on("exit", (code) => {
       logger.warn(`[ACP] exited code ${code}`);
       this.rejectAllPending(new Error(`ACP process exited with code ${code}`));
-      if (code !== 0) this.disconnectHandler?.();
+      if (code !== 0 && !this._skipNextAutoRestart) this.disconnectHandler?.();
+      this._skipNextAutoRestart = false;
     });
 
     this.rl = createInterface({ input: this.proc.stdout!, crlfDelay: Infinity });
@@ -169,11 +176,16 @@ export class AcpClient {
   // === ACP methods ===
 
   async initialize(): Promise<unknown> {
+    if (this._initialized) {
+      logger.debug("[ACP] already initialized");
+      return undefined;
+    }
     logger.info("[ACP] initialize");
     const r = await this.request("initialize", {
       protocolVersion: 1, clientCapabilities: {},
       clientInfo: { name: "vibe-telegram-bot", version: "0.1.0" },
     });
+    this._initialized = true;
     logger.info("[ACP] initialized");
     return r;
   }
@@ -250,8 +262,9 @@ export class AcpClient {
     return this.stderrBuffer;
   }
 
-  stop(): void {
+  stop(skipAutoRestart?: boolean): void {
     logger.info("[ACP] stop");
+    if (skipAutoRestart) this._skipNextAutoRestart = true;
     this.rejectAllPending(new Error("ACP client stopped"));
     this.proc?.kill("SIGTERM");
     setTimeout(() => { if (this.proc && !this.proc.killed) this.proc?.kill("SIGKILL"); }, 3000);

@@ -177,9 +177,10 @@ export class ResponseStreamer {
     logger.debug(`[Stream] finalize: acc=${s.accumulatedText.length} chars, thinking=${s.thinkingText.length}`);
 
     this.cancelTimers();
+    this.cleanup();
 
     await this.enqueue(async () => {
-      if (!this.state?.isActive) return;
+      if (!this.state) return;
 
       // Flush remaining thinking
       if (this.state.thinkingText.length > this.state.thinkingLastSentLength) {
@@ -212,7 +213,6 @@ export class ResponseStreamer {
 
       // Send footer
       this.appendFooter(toolSummary, duration);
-      this.cleanup();
     });
   }
 

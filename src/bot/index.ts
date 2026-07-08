@@ -49,6 +49,43 @@ import {
   type FileAction,
 } from "./files.js";
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+async function restartAcp(acpClient: AcpClient, sessionManager: SessionManager): Promise<boolean> {
+  acpClient.stop(true);
+  await sleep(1000);
+  await acpClient.start();
+  // initialize is idempotent (skip if already done by disconnectHandler)
+  try {
+    await acpClient.initialize();
+  } catch {
+    // ACP crashed — wait for disconnectHandler auto-restart (max 12s)
+    const deadline = Date.now() + 12_000;
+    while (Date.now() < deadline) {
+      await sleep(500);
+      if (acpClient.isConnected()) break;
+    }
+    if (!acpClient.isConnected()) return false;
+    // disconnectHandler may have already called initialize — skip if so
+    try {
+      await acpClient.initialize();
+    } catch {
+      return false;
+    }
+  }
+  // Reload session on the new ACP server
+  const sid = sessionManager.currentSessionId;
+  if (sid) {
+    const cwd = sessionManager.current?.cwd || config.vibe.projectDir;
+    try {
+      await sessionManager.loadSession(sid, cwd);
+    } catch {
+      await sessionManager.createSession(cwd);
+    }
+  }
+  return true;
+}
+
 export async function createBot(acpClient: AcpClient, sessionManager: SessionManager, todoManager?: TodoManager): Promise<Bot<Context>> {
   const bot = new Bot(config.telegram.token);
 
@@ -246,8 +283,8 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
   bot.command("compact", wrap(compactHandler(acpClient, sessionManager)));
   bot.command("todo", todoHandler(todoManager));
   bot.command("help", helpHandler);
-  bot.command("reauth", reauthHandler(acpClient));
-  bot.command("setkey", setkeyHandler(acpClient));
+  bot.command("reauth", reauthHandler(acpClient, sessionManager));
+  bot.command("setkey", setkeyHandler(acpClient, sessionManager));
 
   // Wraps a handler to update the pinned message after completion
   function wrap(handler: (ctx: Context) => Promise<void>): (ctx: Context) => Promise<void> {
@@ -267,22 +304,37 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
       const key = text.trim();
       try {
         const valid = await validateApiKey(key);
-        if (valid) {
-          await ctx.reply("✅ Clé API valide ! Enregistrement et redémarrage...");
-          saveApiKey(key);
-          process.env.MISTRAL_API_KEY = key;
-          logger.info("[Auth] API key updated via chat message");
-
-          // Restart ACP to pick up the new key
-          acpClient.stop();
-          await new Promise((r) => setTimeout(r, 1000));
-          await acpClient.start();
-          await acpClient.initialize();
-          await ctx.reply("✅ Service redémarré avec la nouvelle clé !");
+        if (valid === false) {
+          await ctx.reply("❌ Clé API invalide. Vérifie la clé et réessaie.");
           return;
         }
+        await ctx.reply("✅ Clé API valide ! Enregistrement et redémarrage...");
+        saveApiKey(key);
+        process.env.MISTRAL_API_KEY = key;
+        logger.info("[Auth] API key updated via chat message");
+
+        const restartOk = await restartAcp(acpClient, sessionManager);
+        if (restartOk) {
+          await ctx.reply("✅ Service redémarré avec la nouvelle clé !");
+        } else {
+          logger.warn("[Auth] ACP restart failed after key paste");
+          await ctx.reply("⚠️ Redémarrage impossible. Le service va réessayer automatiquement.");
+        }
+        return;
       } catch {
-        // Not a valid key, continue as normal prompt
+        await ctx.reply("⚠️ Vérification réseau impossible. On utilise la clé quand même.");
+        saveApiKey(key);
+        process.env.MISTRAL_API_KEY = key;
+        logger.info("[Auth] API key saved via chat message (validation skipped due to network)");
+
+        const restartOk = await restartAcp(acpClient, sessionManager);
+        if (restartOk) {
+          await ctx.reply("✅ Service redémarré avec la nouvelle clé !");
+        } else {
+          logger.warn("[Auth] ACP restart failed after key paste (catch)");
+          await ctx.reply("⚠️ Redémarrage impossible. Le service va réessayer automatiquement.");
+        }
+        return;
       }
     }
 
@@ -454,6 +506,19 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
       const stderr = acpClient.getRecentStderr?.() || "";
       if (stderr) logger.warn("[Bot] ACP stderr during error:\n" + stderr.slice(-1000));
 
+      // Check auth FIRST — not retryable, immediate user-facing message
+      const isAuthError = msg.toLowerCase().includes("invalid key") || msg.toLowerCase().includes("invalid api") || msg.toLowerCase().includes("authorization") || msg.toLowerCase().includes("401") || msg.toLowerCase().includes("unauthorized") || msg.toLowerCase().includes("forbidden");
+      if (isAuthError) {
+        logger.error("[Bot] Auth error:", msg);
+        await ctx.reply(
+          "❌ Erreur d'authentification.\n\n" +
+          "Crée une nouvelle clé : https://console.mistral.ai\n" +
+          "Puis `/setkey <ta_clé>`",
+          { parse_mode: "Markdown" },
+        );
+        return;
+      }
+
       // API error — retry with backoff (PoolTimeout, network errors, etc.)
       const isRetryable = retry < MAX_PROMPT_RETRIES && RETRYABLE_ERRORS.some(e => msg.includes(e) || stderr.includes(e));
       if (isRetryable) {
@@ -472,7 +537,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
       }
 
       // Session not found — try to reload from disk, then create new if that fails
-      if (msg.includes("Session not found") && retry < 1) {
+      if (msg.includes("Session not found")) {
         const lastCwd = sessionManager.current?.cwd || config.vibe.projectDir;
         try {
           await sessionManager.loadSession(sid, lastCwd);
@@ -1055,6 +1120,7 @@ function abortHandler(
   return async (ctx: Context) => {
     const sid = sm.currentSessionId;
     if (!sid) { await ctx.reply("No active session."); return; }
+    if (!getBusy()) { await ctx.reply("No prompt is currently running."); return; }
     
     // Annuler la permission en attente si elle existe
     const pt = getPermissionTimeout?.();
@@ -1119,7 +1185,7 @@ function statusHandler(
   };
 }
 
-function reauthHandler(acpClient: AcpClient) {
+function reauthHandler(acpClient: AcpClient, sessionManager: SessionManager) {
   return async (ctx: Context) => {
     await ctx.reply("🔑 Lancement de l'authentification Mistral...");
 
@@ -1138,34 +1204,32 @@ function reauthHandler(acpClient: AcpClient) {
     );
 
     pollAndExchange()
-      .then((newKey) => {
+      .then(async (newKey) => {
         saveApiKey(newKey);
         process.env.MISTRAL_API_KEY = newKey;
         logger.info("[Auth] API key renewed via /reauth");
-        return ctx.reply("✅ Clé API renouvelée ! Redémarrage du service ACP...");
-      })
-      .then(() => {
+        await ctx.reply("✅ Clé API renouvelée ! Redémarrage du service ACP...");
         logger.info("[Auth] Restarting ACP with new API key...");
-        acpClient.stop();
-        return new Promise((r) => setTimeout(r, 1000));
-      })
-      .then(() => acpClient.start())
-      .then(() => acpClient.initialize())
-      .then(() => {
-        logger.info("[Auth] ACP restarted with new API key");
-        ctx.reply("✅ Service redémarré avec la nouvelle clé !").catch(() => {});
+        const restartOk = await restartAcp(acpClient, sessionManager);
+        if (restartOk) {
+          logger.info("[Auth] ACP restarted with new API key");
+          await ctx.reply("✅ Service redémarré avec la nouvelle clé !");
+        } else {
+          logger.warn("[Auth] ACP restart failed after /reauth");
+          await ctx.reply("⚠️ Redémarrage impossible. Le service va réessayer automatiquement.");
+        }
       })
       .catch((err) => {
         const msg = err instanceof Error ? err.message : String(err);
-        logger.warn(`[Auth] /reauth failed: ${msg}`);
+        logger.warn(`[Auth] /reauth poll failed: ${msg}`);
         ctx.reply(
-          `❌ Échec : ${msg}\n\n⚠️ Tu peux obtenir une clé sur https://console.mistral.ai et la coller ici.`,
+          `❌ Échec de l'authentification : ${msg}\n\n⚠️ Tu peux obtenir une clé sur https://console.mistral.ai et la coller ici.`,
         ).catch(() => {});
       });
   };
 }
 
-function setkeyHandler(acpClient: AcpClient) {
+function setkeyHandler(acpClient: AcpClient, sessionManager: SessionManager) {
   return async (ctx: Context) => {
     const text = ctx.message?.text?.trim() || '';
     const key = text.replace('/setkey', '').trim();
@@ -1178,7 +1242,7 @@ function setkeyHandler(acpClient: AcpClient) {
     await ctx.reply("⏳ Validation de la clé...");
     try {
       const valid = await validateApiKey(key);
-      if (!valid) {
+      if (valid === false) {
         await ctx.reply("❌ Clé API invalide. Vérifie la clé et réessaie.");
         return;
       }
@@ -1186,13 +1250,18 @@ function setkeyHandler(acpClient: AcpClient) {
       process.env.MISTRAL_API_KEY = key;
       await ctx.reply("✅ Clé API enregistrée ! Redémarrage du service ACP...");
       logger.info("[Auth] API key updated via /setkey");
-      acpClient.stop();
-      await new Promise((r) => setTimeout(r, 1000));
-      await acpClient.start();
-      await acpClient.initialize();
-      await ctx.reply("✅ Service redémarré avec la nouvelle clé !");
+
+      const restartOk = await restartAcp(acpClient, sessionManager);
+      if (restartOk) {
+        await ctx.reply("✅ Service redémarré avec la nouvelle clé !");
+      } else {
+        logger.warn("[Auth] ACP restart failed after /setkey");
+        await ctx.reply("⚠️ Redémarrage impossible. Le service va réessayer automatiquement.");
+      }
     } catch (err) {
-      await ctx.reply(`❌ Erreur : ${err instanceof Error ? err.message : String(err)}`);
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.warn(`[Auth] /setkey validation error: ${msg}`);
+      await ctx.reply(`❌ Erreur : ${msg}`);
     }
   };
 }
