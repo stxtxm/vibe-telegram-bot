@@ -48,9 +48,11 @@ export class AcpClient {
     const bin = process.env.VIBE_PATH || ".venv/bin/vibe-acp";
     const cwd = process.env.VIBE_CWD || process.cwd();
     const env: Record<string, string | undefined> = { ...process.env };
-    if (!env.MISTRAL_API_KEY) {
-      const key = loadMistralKey();
-      if (key) env.MISTRAL_API_KEY = key;
+    // ~/.vibe/.env is the canonical key source (updated by /setkey, key-paste, /reauth).
+    // Prefer it over process.env which may have a stale key from systemd's EnvironmentFile.
+    const vibeKey = loadMistralKey();
+    if (vibeKey) {
+      env.MISTRAL_API_KEY = vibeKey;
     }
 
     this.proc = spawn(bin, [], { cwd, stdio: ["pipe", "pipe", "pipe"], env, detached: true });

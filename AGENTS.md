@@ -387,10 +387,11 @@ rm -rf dist node_modules
 
 ### Session Summary (2026-07-08)
 
-**Problem**: API key `V1jt1KzN7bMaMlKExFk6OC3PMalQQ4V6` was valid at startup (HTTP 200) but Mistral returned 401 transiently at 22:08:35. The bot's auth error handler called `validateApiKey()` which ALSO hit the same transient Mistral API failure → bot declared key permanently invalid. The key was fine the whole time.
+**Problem**: The bot's systemd `.env` file (`/home/timo/dev/telegram-bots/vibe-telegram-bot/.env`) had an old/stale `MISTRAL_API_KEY='4t6fhE7MmsWQWwMwQUIJkeC80nlD1MR3'` (returns 401). This was loaded by systemd into `process.env.MISTRAL_API_KEY`. When the ACP client started, it checked `if (!env.MISTRAL_API_KEY)` — but it WAS set (stale) — so it never loaded the correct key from `~/.vibe/.env`. Key changes via `/setkey`, key-paste, or `/reauth` write to `~/.vibe/.env` but the ACP ignored it.
 
-**Fix**: Auth error handler (`src/bot/index.ts:509`) now restarts ACP and retries the prompt instead of validating the key first. Key re-validation can fail during Mistral API hiccups, falsely confirming the key is bad. New flow:
-1. ACP reports auth error → bot restarts ACP (reloads key from `~/.vibe/.env`) → retries once
-2. If retry also fails auth → show permanent "❌" error
-3. Also checks `stderr` for "Invalid API key" (ACP's stderr sometimes has auth keywords that the JSON-RPC error message lacks)
+**Fix 1** (`src/acp/client.ts:50-53`): ACP `start()` now **always** loads the key from `~/.vibe/.env` and uses it, regardless of `process.env.MISTRAL_API_KEY`. This makes `~/.vibe/.env` the single source of truth.
+
+**Fix 2**: Updated systemd `.env` file to match `~/.vibe/.env` so both are in sync.
+
+**Also included from earlier**: Auth error handler (`src/bot/index.ts:509`) restarts ACP + retries instead of validating key first (handles transient Mistral API hiccups).
 **Project Version**: 0.1.0
