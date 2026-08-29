@@ -170,33 +170,46 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     const usage = responseStreamer.usage;
 
     const lines: string[] = [
-      `📌 **Session** — ${escapeMarkdown(title)}`,
-      `🎯 Model: \`${escapeMarkdown(model)}\`  ⚙️ Mode: \`${escapeMarkdown(mode)}\`  💭 \`${thinking}\``,
-      `📍 \`${escapeMarkdown(cwd)}\``,
+      `📌 **${escapeMarkdown(title)}**`,
     ];
 
+    // Project + branch like opencode's pinned
+    let branch: string | null = null;
+    try {
+      const { execSync } = await import("node:child_process");
+      branch = execSync(`git -C "${cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: "utf8" }).trim() || null;
+      if (branch === "HEAD") branch = null;
+    } catch { /* not a git repo */ }
+    const projectLine = branch ? `📁 \`${escapeMarkdown(cwd)}\` : \`${escapeMarkdown(branch)}\`` : `📁 \`${escapeMarkdown(cwd)}\``;
+    lines.push(projectLine);
+    lines.push(`🎯 \`${escapeMarkdown(model)}\`  ⚙️ \`${escapeMarkdown(mode)}\`  💭 \`${escapeMarkdown(thinking)}\``);
+
     if (usage && (usage.inputTokens > 0 || usage.outputTokens > 0)) {
-      lines.push(`📊 ${usage.inputTokens}→${usage.outputTokens} tok${usage.cost > 0 ? `  💰 $${usage.cost.toFixed(4)}` : ""}`);
+      const total = usage.inputTokens + usage.outputTokens;
+      const pct = total > 0 ? ` (${Math.round((total / 200000) * 100)}%)` : "";
+      lines.push(`📊 ${usage.inputTokens}→${usage.outputTokens} tok${pct}${usage.cost > 0 ? `  💰 $${usage.cost.toFixed(4)}` : ""}`);
     }
 
-    // Context metrics from ACP stderr
     contextChars = acpClient.contextChars;
     contextMessages = acpClient.contextMessages;
     if (contextChars > 0) {
-      let ctxLine = `📐 ${(contextChars / 1000).toFixed(0)}K chars`;
+      const pct = Math.round((contextChars / 200000) * 100);
+      let ctxLine = `📐 ${(contextChars / 1000).toFixed(0)}K / 200K (${pct}%)`;
       if (contextMessages > 0) ctxLine += ` · ${contextMessages} msg`;
       lines.push(ctxLine);
     }
 
-    if (toolCountWrapper.n > 0) {
+    if (toolCountWrapper.n > 0 || changedFiles.size > 0) {
       let info = `🛠️ ${toolCountWrapper.n} tool${toolCountWrapper.n !== 1 ? "s" : ""}`;
       if (changedFiles.size > 0) {
-        info += `  📄 ${changedFiles.size} file${changedFiles.size !== 1 ? "s" : ""}`;
+        const files = Array.from(changedFiles).slice(0, 5);
+        const more = changedFiles.size > 5 ? ` +${changedFiles.size - 5}` : "";
+        info += `  📄 ${files.map(f => f.split("/").pop()).join(", ")}${more}`;
       }
       lines.push(info);
     }
 
-    lines.push(`${busyIcon} ${busy ? "Busy…" : "Idle"}`);
+    lines.push(`${busyIcon} ${busy ? "🔴 Busy…" : "🟢 Prêt"}`);
 
     const text = lines.join("\n");
 
@@ -213,6 +226,8 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     try {
       const msg = await bot.api.sendMessage(chatId, text, { parse_mode: "Markdown", disable_notification: true });
       pinnedMessageId = msg.message_id;
+      // Pin like opencode-telegram-bot does (quiet, survive restarts)
+      try { await bot.api.pinChatMessage(chatId, pinnedMessageId, { disable_notification: true }); } catch { /* already pinned or no rights */ }
     } catch (e) {
       logger.warn("[Pinned] Failed to create pinned message:", e);
     }
@@ -255,12 +270,14 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     { command: "help", description: "Show help" },
     { command: "reauth", description: "Reconnect Mistral API key" },
     { command: "setkey", description: "Set Mistral API key manually" },
+    { command: "plan", description: "Switch to plan mode" },
   ]);
 
   bot.command("start", wrap(startHandler(sessionManager)));
   bot.command("model", modelHandler(sessionManager));
   bot.command("mode", modeHandler(sessionManager));
   bot.command("thinking", thinkingHandler(sessionManager));
+  bot.command("plan", planHandler(sessionManager));
   bot.command("sessions", sessionsHandler(sessionManager));
   bot.command("files", filesHandler(sessionManager));
   bot.command("cd", wrap(cdHandler(sessionManager)));
@@ -299,8 +316,8 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     const text = ctx.message.text;
     if (text.startsWith("/")) return;
 
-    // If message looks like a Mistral API key (~32 alphanumeric chars), save and restart
-    if (/^[A-Za-z0-9_-]{20,50}$/.test(text.trim())) {
+    // If message looks like a Mistral API key (32 chars, opportunistic), save and restart
+    if (/^[A-Za-z0-9_-]{32}$/.test(text.trim())) {
       const key = text.trim();
       try {
         const valid = await validateApiKey(key);
@@ -433,17 +450,30 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     }
     let recovered = false;
     try {
-      // Auto-compact if context exceeds threshold
-      const AUTO_COMPACT_THRESHOLD = 50_000;
+      // Auto-compact if context exceeds threshold - fixed to not modify session title and not block
+      const AUTO_COMPACT_THRESHOLD = 180_000;
       if (acpClient.contextChars > AUTO_COMPACT_THRESHOLD) {
+        const prevTitle = sessionManager.getSession(sid)?.title;
         logger.info(`[Compact] Auto-compact triggered: ${acpClient.contextChars} chars > ${AUTO_COMPACT_THRESHOLD}`);
         isCompacting = true;
-        await acpClient.sendPrompt(sid,
-          "Compact/compress the conversation history above into a short concise summary, " +
-          "preserving all decisions, code changes, and important context. Output only the summary."
-        );
+        try {
+          await acpClient.sendPrompt(sid,
+            "[system compact] Compact/compress the conversation history above into a short concise summary, " +
+            "preserving all decisions, code changes, and important context. Output only the summary."
+          );
+        } catch (e) {
+          logger.warn("[Compact] Auto-compact prompt failed, continuing:", e);
+        }
         isCompacting = false;
         await new Promise(r => setTimeout(r, 1500));
+        // Restore title if it was changed to the compact prompt (opencode-style)
+        try {
+          const cur = sessionManager.getSession(sid);
+          if (prevTitle && cur && cur.title !== prevTitle && cur.title?.toLowerCase().includes("compact")) {
+            await sessionManager.setTitle(sid, prevTitle);
+            logger.info(`[Compact] Restored title after auto-compact: ${prevTitle}`);
+          }
+        } catch { /* ignore */ }
       }
       const result = await acpClient.sendPrompt(sid, effectiveText) as Record<string, unknown> | undefined;
 
@@ -505,6 +535,21 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
 
       const stderr = acpClient.getRecentStderr?.() || "";
       if (stderr) logger.warn("[Bot] ACP stderr during error:\n" + stderr.slice(-1000));
+
+      // Payment / subscription error — do NOT retry, surface directly (opencode-style)
+      const isPaymentError = msg.includes("402") || msg.toLowerCase().includes("payment required") || msg.toLowerCase().includes("subscription") || stderr.toLowerCase().includes("payment required") || stderr.toLowerCase().includes("subscription");
+      if (isPaymentError) {
+        logger.error("[Bot] Payment/subscription error:", msg);
+        await ctx.reply(
+          "❌ **Quota épuisé / Abonnement requis**\n\n" +
+          "Mistral a refusé la requête (402 Payment Required).\n" +
+          "• Vérifie https://admin.mistral.ai/subscription\n" +
+          "• Ou passe en modèle gratuit : /model → `devstral-small` / `local`\n" +
+          "• Ou reconnecte : /reauth",
+          { parse_mode: "Markdown" },
+        );
+        return;
+      }
 
       // Auth error — restart ACP + retry before declaring permanent
       const isAuthError = msg.toLowerCase().includes("invalid key") || msg.toLowerCase().includes("invalid api") || msg.toLowerCase().includes("authorization") || msg.toLowerCase().includes("401") || msg.toLowerCase().includes("unauthorized") || msg.toLowerCase().includes("forbidden") || stderr.toLowerCase().includes("invalid key");
@@ -619,6 +664,10 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
         } else {
           await ctx.reply("❌ Session expirée et impossible d'en créer une nouvelle. Essaie /start.");
         }
+      } else if (msg.includes("Concurrent prompts") || msg.includes("already busy") || stderr.includes("Concurrent")) {
+        logger.warn("[Bot] Concurrent prompt ignored:", msg);
+        await ctx.reply("⏳ Déjà occupé — attends la fin ou /abort", { parse_mode: "Markdown" });
+        return;
       } else {
         logger.error("[Bot] Prompt error:", msg);
         if (retry === 0) {
@@ -1138,6 +1187,21 @@ function thinkingHandler(sm: SessionManager) {
   };
 }
 
+function planHandler(sm: SessionManager) {
+  return async (ctx: Context) => {
+    const s = sm.current;
+    if (!s?.modes) { await ctx.reply("No session. Use /start."); return; }
+    const planMode = s.modes.availableModes.find(m => m.id.toLowerCase().includes("plan")) || s.modes.availableModes.find(m => m.name.toLowerCase().includes("plan"));
+    const targetId = planMode?.id || "plan";
+    try {
+      await sm.setMode(s.id, targetId);
+      await ctx.reply(`✅ Mode plan activé (\`${targetId}\`)`, { parse_mode: "Markdown" });
+    } catch (err) {
+      await ctx.reply(`❌ ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+}
+
 function sessionsHandler(sm: SessionManager) {
   return async (ctx: Context) => {
     try {
@@ -1167,12 +1231,26 @@ function compactHandler(acp: AcpClient, sm: SessionManager) {
   return async (ctx: Context) => {
     const sid = sm.currentSessionId;
     if (!sid) { await ctx.reply("No session. Use /start."); return; }
+    const prevTitle = sm.getSession(sid)?.title;
     await ctx.reply("🔄 **Compactage du contexte...** Envoi d'une demande de compression mémoire.", { parse_mode: "Markdown" });
     try {
-      await acp.sendPrompt(sid, "Please compact/compress the conversation history to reduce context usage while preserving all important information.");
-      await ctx.reply("✅ Demande de compactage envoyée. Le modèle va compresser le contexte.");
+      await acp.sendPrompt(sid, "[system compact] Please compact/compress the conversation history to reduce context usage while preserving all important information.");
+      // Restore title if compact prompt overwrote it
+      try {
+        const cur = sm.getSession(sid);
+        if (prevTitle && cur && cur.title !== prevTitle && cur.title?.toLowerCase().includes("compact")) {
+          await sm.setTitle(sid, prevTitle);
+        }
+      } catch { /* ignore */ }
+      await ctx.reply("✅ Compactage terminé. Contexte réduit.");
     } catch (err) {
-      await ctx.reply(`❌ ${err instanceof Error ? err.message : String(err)}`);
+      const msg = err instanceof Error ? err.message : String(err);
+      // Don't recreate session on compact failure - just report
+      if (msg.includes("Session not found")) {
+        await ctx.reply("❌ Session expirée. Utilise /start pour une nouvelle session.");
+      } else {
+        await ctx.reply(`❌ ${msg}`);
+      }
     }
   };
 }

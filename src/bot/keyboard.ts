@@ -70,11 +70,10 @@ export class KeyboardManager {
   private async sendKeyboardUpdate(): Promise<void> {
     const kb = this.buildKeyboard();
     try {
-      const msg = await this.bot.api.sendMessage(this.chatId, "⌨️", {
+      await this.bot.api.sendMessage(this.chatId, "⌨️ clavier", {
         reply_markup: kb,
         disable_notification: true,
       });
-      await this.bot.api.deleteMessage(this.chatId, msg.message_id).catch(() => {});
     } catch (err) {
       logger.warn("[Keyboard] Failed to send update:", err);
     }
@@ -95,16 +94,12 @@ export class KeyboardManager {
 
   buildKeyboard(): Keyboard {
     const kb = new Keyboard();
-    const tokIn = this.formatTokenCount(this.state.inputTokens);
-    const tokOut = this.formatTokenCount(this.state.outputTokens);
-    const cost = this.state.cost > 0 ? `$${this.state.cost.toFixed(4)}` : "—";
-    const cwd = this.truncatePath(this.state.sessionCwd);
-
-    kb.text(`🎯 ${this.state.currentModel}`).text(`📍 ${cwd}`).row();
-    kb.text(`📊 ${tokIn}→${tokOut}`).text(`💰 ${cost}`).row();
-    kb.text("/sessions").text("/model").text("/mode").row();
-    kb.text("/thinking").text("/files").text("/help").row();
-    return kb.resized();
+    // Clean command-only keyboard like opencode - no emoji display values that get sent as prompts
+    kb.text("/model").text("/mode").row();
+    kb.text("/thinking").text("/plan").row();
+    kb.text("/sessions").text("/files").row();
+    kb.text("/help").text("/status").row();
+    return kb.resized().persistent();
   }
 
   getKeyboard(): Keyboard {
