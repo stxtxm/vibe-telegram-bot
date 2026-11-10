@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 
 // Mock dependencies BEFORE importing from bot/index
 vi.mock("../src/config.js", () => ({
@@ -35,7 +35,7 @@ vi.mock("grammy", () => ({
 }));
 
 // Now import the testable functions
-import { splitMessage, extractTodos } from "../src/bot/index.js";
+import { splitMessage } from "../src/bot/index.js";
 
 describe("splitMessage", () => {
   it("should return single chunk for short messages", () => {
@@ -73,32 +73,5 @@ describe("splitMessage", () => {
     expect(result).toHaveLength(2);
     expect(result[0]).toBe(a + "\n");
     expect(result[1]).toBe(b);
-  });
-});
-
-describe("extractTodos", () => {
-  it("should extract markdown checklist items", () => {
-    expect(extractTodos("- [ ] Fix bug\n- [ ] Add tests")).toEqual(["Fix bug", "Add tests"]);
-  });
-
-  it("should extract TODO: prefixed items", () => {
-    expect(extractTodos("TODO: Impl feature\nTODO: Write docs")).toEqual(["Impl feature", "Write docs"]);
-  });
-
-  it("should extract mixed formats", () => {
-    expect(extractTodos("- [ ] Task one\nTODO: Task two\n* [ ] Task three")).toEqual(["Task one", "Task two", "Task three"]);
-  });
-
-  it("should extract **TODO:** items", () => {
-    expect(extractTodos("- **TODO:** Important")).toEqual(["Important"]);
-  });
-
-  it("should not extract completed items", () => {
-    expect(extractTodos("- [x] Done\n- [ ] Pending")).toEqual(["Pending"]);
-  });
-
-  it("should return empty array when no todos", () => {
-    expect(extractTodos("Just text")).toEqual([]);
-    expect(extractTodos("")).toEqual([]);
   });
 });

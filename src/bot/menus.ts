@@ -1,5 +1,5 @@
 import { InlineKeyboard } from "grammy";
-import type { ACPModel, ACPMode, ACPConfigOption, ACPSessionInfo } from "../acp/protocol.js";
+import type { ACPModel, ACPMode, ACPSessionInfo } from "../acp/protocol.js";
 
 export { isFileAction } from "./files.js";
 
@@ -120,5 +120,5 @@ export function buildQuestionMenu(questionIndex: number, questionText: string, o
 }
 
 function escapeMenuText(text: string): string {
-  return text.replace(/([_*\[\]()~`>#+\-=|{}.!])/g, "\\$1");
+  return text.replace(/([_*[\]()~`>#+\-=|{}.!])/g, "\\$1");
 }

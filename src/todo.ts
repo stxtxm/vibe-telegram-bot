@@ -1,6 +1,5 @@
 import { promises as fs } from "node:fs";
 import { join } from "node:path";
-import { logger } from "./utils/logger.js";
 
 export interface TodoItem {
   id: number;

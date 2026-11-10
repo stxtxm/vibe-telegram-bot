@@ -1,13 +1,12 @@
-import { Bot, type Context, InlineKeyboard, InputFile, Keyboard } from "grammy";
+import { Bot, type Context, InlineKeyboard, InputFile } from "grammy";
 import { config } from "../config.js";
 import { logger } from "../utils/logger.js";
 import { promises as fs } from 'node:fs';
 import { dirname, basename, join } from 'node:path';
 import type { AcpClient } from "../acp/client.js";
-import { SessionManager, type SessionState } from "../acp/session.js";
+import { SessionManager } from "../acp/session.js";
 import { TodoManager } from "../todo.js";
 import {
-  loadApiKey,
   validateApiKey,
   startSignIn,
   pollAndExchange,
@@ -48,6 +47,8 @@ import {
   getFileContent,
   type FileAction,
 } from "./files.js";
+import { formatFileSize } from "../utils/fs.js";
+import { PromptQueue, type QueuedPrompt } from "./queue.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -90,6 +91,9 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
   const bot = new Bot(config.telegram.token);
 
   let busy = false;
+  // Prompts received while busy wait here instead of cancelling the running one
+  const promptQueue = new PromptQueue();
+  let lastPromptText: string | null = null;
   let progressChatId: number | null = null;
   let progressMessageId: number | null = null;
   let progressText = "";
@@ -99,9 +103,6 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
   // Streaming state (Phase 1a/1b/2) — managed by ResponseStreamer
   const responseStreamer = new ResponseStreamer(bot, config.telegram.allowedUserId);
   let promptStartTime = 0;
-
-  // Original user message ID (for replying to)
-  let originalUserMessageId: number | null = null;
 
   // Pinned status message (Phase 3a)
   let pinnedMessageId: number | null = null;
@@ -135,20 +136,78 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     return () => clearInterval(interval);
   }
 
-  async function replyWithHtml(chatId: number, text: string, extra?: Record<string, unknown>): Promise<{ message_id: number }> {
-    try {
-      return await bot.api.sendMessage(chatId, text, { parse_mode: "HTML", ...extra } as never);
-    } catch {
-      return await bot.api.sendMessage(chatId, text, extra as never);
-    }
+  /** Minimal Context shim so queued prompts reuse runPrompt's reply paths. */
+  function jobContext(job: QueuedPrompt): Context {
+    return {
+      message: { text: job.text, message_id: job.messageId },
+      chat: { id: job.chatId },
+      reply: (text: string, extra?: Record<string, unknown>) =>
+        bot.api.sendMessage(job.chatId, text, extra as never),
+    } as unknown as Context;
   }
 
-  async function editWithHtml(chatId: number, messageId: number, text: string, extra?: Record<string, unknown>): Promise<void> {
-    try {
-      await bot.api.editMessageText(chatId, messageId, text, { parse_mode: "HTML", ...extra } as never);
-    } catch {
-      try { await bot.api.editMessageText(chatId, messageId, text, extra as never); } catch { /* ignore */ }
+  async function startPrompt(job: QueuedPrompt, sid: string): Promise<void> {
+    const generation = ++promptGeneration;
+    busy = true;
+    lastPromptText = job.text;
+    pendingUpload = job.upload ?? null;
+    progressText = "";
+    toolCallMap = new Map();
+    changedFiles.clear();
+    toolCountWrapper.n = 0;
+    promptStartTime = Date.now();
+    await updatePinnedMessage();
+
+    // Streaming message with an abort button
+    progressMessageId = await responseStreamer.start(generation, job.messageId);
+    progressChatId = job.chatId;
+    const stopTyping = startTypingInterval(job.chatId);
+
+    runPrompt(acpClient, jobContext(job), sid, generation, stopTyping).catch((err) => {
+      logger.error("[Prompt] Background error:", err);
+    });
+  }
+
+  async function drainQueue(): Promise<void> {
+    if (busy) return;
+    const next = promptQueue.dequeue();
+    if (!next) return;
+    const sid = sessionManager.currentSessionId;
+    if (!sid) {
+      await bot.api.sendMessage(next.chatId, "❌ Aucune session active — message en attente ignoré.").catch(() => {});
+      return drainQueue();
     }
+    logger.info(`[Queue] Starting queued prompt (${promptQueue.size} left)`);
+    await startPrompt(next, sid);
+  }
+
+  async function abortCurrentPrompt(): Promise<{ aborted: boolean; cleared: number }> {
+    const sid = sessionManager.currentSessionId;
+    const wasBusy = busy;
+    const cleared = promptQueue.clear();
+
+    if (pendingPermission) {
+      logger.info(`[Permission] Auto-rejected id=${pendingPermission.id} (abort)`);
+      if (permissionTimeout) { clearTimeout(permissionTimeout); permissionTimeout = null; }
+      acpClient.respondPermissionError(pendingPermission.id);
+      pendingPermission = null;
+    }
+
+    if (wasBusy && sid) {
+      logger.info("[Abort] Cancelling current prompt");
+      // Invalidate the in-flight completion so it cannot finalize the stream
+      promptGeneration++;
+      acpClient.cancelPrompt(sid);
+      responseStreamer.abort();
+      busy = false;
+      progressChatId = null;
+      progressMessageId = null;
+      progressText = "";
+      toolCallMap = new Map();
+      keyboardManager.flushKeyboard();
+    }
+    await updatePinnedMessage();
+    return { aborted: wasBusy, cleared };
   }
 
   async function updatePinnedMessage(): Promise<void> {
@@ -235,10 +294,6 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
 
   // Persistent reply keyboard (Phase 3c)
   const keyboardManager = new KeyboardManager(bot, config.telegram.allowedUserId);
-  function getKeyboard(): Keyboard {
-    return keyboardManager.getKeyboard();
-  }
-
   // === AUTH MIDDLEWARE ===
   bot.use(async (ctx, next) => {
     if (ctx.callbackQuery) {
@@ -263,6 +318,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     { command: "pwd", description: "Show current working directory" },
     { command: "close", description: "Close current session" },
     { command: "abort", description: "Abort the current prompt" },
+    { command: "retry", description: "Retry the last prompt" },
     { command: "rename", description: "Rename session" },
     { command: "status", description: "Show session info" },
     { command: "compact", description: "Compress conversation context" },
@@ -283,20 +339,32 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
   bot.command("cd", wrap(cdHandler(sessionManager)));
   bot.command("pwd", pwdHandler(sessionManager));
   bot.command("close", closeHandler(acpClient, sessionManager));
-  bot.command("abort", abortHandler(
-    acpClient, sessionManager, 
-    () => busy, 
-    (v) => { busy = v; },
-    (v) => { progressChatId = v; },
-    (v) => { progressMessageId = v; },
-    (v) => { progressText = v; },
-    (v) => { toolCallMap = v; },
-    () => permissionTimeout,
-    (v) => { permissionTimeout = v; },
-    () => { pendingPermission = null; },
-  ));
+  bot.command("abort", async (ctx) => {
+    const { aborted, cleared } = await abortCurrentPrompt();
+    const suffix = cleared > 0 ? ` ${cleared} message(s) en attente supprimé(s).` : "";
+    await ctx.reply(aborted ? `⏹️ Prompt annulé.${suffix}` : `Aucun prompt en cours.${suffix}`);
+  });
+  bot.command("retry", async (ctx) => {
+    if (!lastPromptText) { await ctx.reply("Aucun prompt à relancer."); return; }
+    const sid = sessionManager.currentSessionId;
+    if (!sid) { await ctx.reply("No session. Use /start."); return; }
+    const upload = pendingUpload;
+    pendingUpload = null;
+    const job: QueuedPrompt = {
+      text: lastPromptText,
+      messageId: ctx.message?.message_id ?? 0,
+      chatId: ctx.chat?.id ?? config.telegram.allowedUserId,
+      upload,
+    };
+    if (busy) {
+      promptQueue.enqueue(job);
+      await ctx.reply(`📥 Relance mise en file d'attente (#${promptQueue.size}).`);
+      return;
+    }
+    await startPrompt(job, sid);
+  });
   bot.command("rename", wrap(renameHandler(acpClient, sessionManager)));
-  bot.command("status", statusHandler(sessionManager, () => pendingPermission, () => busy));
+  bot.command("status", statusHandler(sessionManager, () => pendingPermission, () => busy, () => promptQueue.size));
   bot.command("compact", wrap(compactHandler(acpClient, sessionManager)));
   bot.command("todo", todoHandler(todoManager));
   bot.command("help", helpHandler);
@@ -358,38 +426,27 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     const sid = sessionManager.currentSessionId;
     if (!sid) { await ctx.reply("No session. Use /start."); return; }
 
-    // Cancel any running prompt and start fresh
+    // A prompt is already running: queue this message instead of killing it.
+    const upload = pendingUpload;
+    pendingUpload = null;
+    const job: QueuedPrompt = {
+      text,
+      messageId: ctx.message.message_id,
+      chatId: ctx.chat.id,
+      upload,
+    };
+
     if (busy) {
-      // Send accumulated progress before canceling
-      if (progressText) {
-        ctx.reply(`📝 **Accumulé avant annulation:**\n\n${progressText.slice(0, 2000)}`).catch(() => {});
-      }
-      if (pendingPermission) {
-        logger.info(`[Permission] Auto-rejected id=${pendingPermission.id} (new prompt)`);
-        if (permissionTimeout) { clearTimeout(permissionTimeout); permissionTimeout = null; }
-        acpClient.respondPermissionError(pendingPermission.id);
-        pendingPermission = null;
-      }
-      acpClient.cancelPrompt(sid);
+      const position = promptQueue.enqueue(job);
+      await ctx.reply(
+        `📥 **Message mis en attente** (${position} dans la file).\n` +
+        `Il sera traité dès la fin du prompt en cours. /abort pour tout arrêter.`,
+        { parse_mode: "Markdown" },
+      );
+      return;
     }
 
-    const generation = ++promptGeneration;
-    busy = true;
-    progressText = "";
-    toolCallMap = new Map();
-    changedFiles.clear();
-    toolCountWrapper.n = 0;
-    promptStartTime = Date.now();
-    updatePinnedMessage();
-
-    // Start response streamer (creates the progress message with abort button)
-    progressMessageId = await responseStreamer.start(generation, ctx.message.message_id);
-    progressChatId = ctx.chat.id;
-    const stopTyping = startTypingInterval(ctx.chat.id);
-
-    runPrompt(acpClient, ctx, sid, generation, stopTyping).catch((err) => {
-      logger.error("[Prompt] Background error:", err);
-    });
+    await startPrompt(job, sid);
   });
 
   // === FILE UPLOAD HANDLER ===
@@ -426,7 +483,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
 
       pendingUpload = destPath;
       await ctx.reply(
-        `📄 Fichier reçu : \`${escapeMarkdown(fileName)}\` (${formatFileSizeStatic(fileSize)})\n📍 Sauvegardé dans le projet.\n📝 Envoie maintenant un message pour dire à Vibe quoi en faire.`,
+        `📄 Fichier reçu : \`${escapeMarkdown(fileName)}\` (${formatFileSize(fileSize)})\n📍 Sauvegardé dans le projet.\n📝 Envoie maintenant un message pour dire à Vibe quoi en faire.`,
         { parse_mode: "Markdown" },
       );
     } catch (err) {
@@ -475,7 +532,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
           }
         } catch { /* ignore */ }
       }
-      const result = await acpClient.sendPrompt(sid, effectiveText) as Record<string, unknown> | undefined;
+      await acpClient.sendPrompt(sid, effectiveText);
 
       // Stale — a newer prompt has superseded this one
       if (generation < promptGeneration) {
@@ -702,8 +759,11 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
         progressChatId = null;
         progressMessageId = null;
         keyboardManager.flushKeyboard();
+        await updatePinnedMessage();
+        await drainQueue();
+      } else {
+        updatePinnedMessage();
       }
-      updatePinnedMessage();
     }
   }
 
@@ -718,8 +778,6 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     "allow": "✅ Autorisé",
   };
 
-  let alwaysAllowedSet = new Set<string>();
-
   // === CALLBACK QUERY HANDLER ===
   // Handle ALL callback queries with regex catcher
   bot.callbackQuery(/.*/, async (ctx) => {
@@ -728,27 +786,10 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     logger.info(`[Callback] data="${data}" user=${ctx.from?.id}`);
     const sid = sessionManager.currentSessionId;
 
-    // Abort prompt
+    // Abort prompt (same path as the /abort command)
     if (data.startsWith("abort:")) {
-      const gen = parseInt(data.split(":")[1], 10);
-      if (busy && gen > 0 && gen <= promptGeneration) {
-        if (sid) acpClient.cancelPrompt(sid);
-        if (pendingPermission) {
-          if (permissionTimeout) { clearTimeout(permissionTimeout); permissionTimeout = null; }
-          acpClient.respondPermissionError(pendingPermission.id);
-          pendingPermission = null;
-        }
-        // Abort the streamer (sets progress to cancelled)
-        responseStreamer.abort();
-        if (progressText) {
-          await ctx.reply(`📝 **Accumulé avant annulation:**\n\n${progressText.slice(0, 2000)}`);
-        }
-        await ctx.editMessageText("⏹️ Annulé").catch(() => {});
-        busy = false;
-        updatePinnedMessage();
-      } else {
-        await ctx.editMessageText("✅ Déjà terminé").catch(() => {});
-      }
+      const { aborted } = await abortCurrentPrompt();
+      await ctx.editMessageText(aborted ? "⏹️ Annulé" : "✅ Déjà terminé").catch(() => {});
       return;
     }
 
@@ -756,7 +797,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     if (data.startsWith("perm:")) {
       const parts = data.split(":");
       if (parts.length === 3) {
-        const [_, idStr, optionId] = parts;
+        const [, idStr, optionId] = parts;
         const permId = parseInt(idStr, 10);
         if (pendingPermission && permId === pendingPermission.id) {
           if (permissionTimeout) { clearTimeout(permissionTimeout); permissionTimeout = null; }
@@ -766,10 +807,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
             await acpClient.respondPermission(pendingPermission.id, optionId);
             const feedback = PERMISSION_FEEDBACK[optionId] || `✅ ${optionId}`;
             await ctx.editMessageText(feedback);
-            if (optionId === "allow_always" || optionId === "always") {
-              alwaysAllowedSet.add(`perm:${pendingPermission.sessionId}:${optionId}`);
-              logger.info(`[Permission] Always allowed set, total=${alwaysAllowedSet.size}`);
-            }
+
           } catch (err) {
             await ctx.editMessageText(`❌ ${err}`).catch(() => {});
           }
@@ -866,7 +904,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
         } else {
           await ctx.editMessageText("Session not found locally. Use /start to create a new one.");
         }
-      } catch (err) {
+      } catch {
         await ctx.editMessageText(`❌ Erreur : la session est introuvable sur le serveur`).catch(() => {});
       }
       return;
@@ -921,9 +959,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
 
   // === ACP NOTIFICATIONS ===
   acpClient.onMessage((msg) => {
-    handleAcpNotification(msg, bot, acpClient, () => progressChatId, () => progressMessageId, (id) => { progressMessageId = id; },     (t) => { progressText += t; }, () => { return progressText; }, () => {
-      responseStreamer.setToolSummary(buildToolSummary(toolCallMap));
-    }, (p) => {
+    handleAcpNotification(msg, bot, (t) => { progressText += t; }, (p) => {
       // Clear previous timeout
       if (permissionTimeout) { clearTimeout(permissionTimeout); permissionTimeout = null; }
       pendingPermission = p;
@@ -959,8 +995,6 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
       responseStreamer.setUsage(usage);
       keyboardManager.updateUsage(usage.inputTokens, usage.outputTokens, usage.cost);
       keyboardManager.refreshKeyboard();
-    }, (summary) => {
-      responseStreamer.setToolSummary(summary);
     }, (icon, label) => {
       responseStreamer.addToolEntry(icon, label);
     }).catch((err) => {
@@ -1255,42 +1289,6 @@ function compactHandler(acp: AcpClient, sm: SessionManager) {
   };
 }
 
-function abortHandler(
-  acp: AcpClient, 
-  sm: SessionManager, 
-  getBusy: () => boolean, 
-  setBusy: (v: boolean) => void,
-  setProgressChatId: (v: number | null) => void,
-  setProgressMessageId: (v: number | null) => void,
-  setProgressText: (v: string) => void,
-  setToolCallMap: (v: Map<string, { name: string; kind: string; input?: Record<string, unknown> }>) => void,
-  getPermissionTimeout?: () => ReturnType<typeof setTimeout> | null,
-  setPermissionTimeout?: (v: ReturnType<typeof setTimeout> | null) => void,
-  clearPendingPermission?: () => void,
-) {
-  return async (ctx: Context) => {
-    const sid = sm.currentSessionId;
-    if (!sid) { await ctx.reply("No active session."); return; }
-    if (!getBusy()) { await ctx.reply("No prompt is currently running."); return; }
-    
-    // Annuler la permission en attente si elle existe
-    const pt = getPermissionTimeout?.();
-    if (pt) { clearTimeout(pt); setPermissionTimeout?.(null); }
-    clearPendingPermission?.();
-    
-    acp.cancelPrompt(sid);
-    
-    // Réinitialiser TOUT l'état de progression
-    setBusy(false);
-    setProgressChatId(null);
-    setProgressMessageId(null);
-    setProgressText("");
-    setToolCallMap(new Map());
-    
-    await ctx.reply("⏹️ Prompt aborted.");
-  };
-}
-
 function renameHandler(acp: AcpClient, sm: SessionManager) {
   return async (ctx: Context) => {
     const sid = sm.currentSessionId;
@@ -1311,6 +1309,7 @@ function statusHandler(
   sm: SessionManager,
   getPendingPermission?: () => { id: number; sessionId: string } | null,
   getBusy?: () => boolean,
+  getQueueSize?: () => number,
 ) {
   return async (ctx: Context) => {
     const s = sm.current;
@@ -1329,9 +1328,11 @@ function statusHandler(
     if (getBusy?.()) {
       status += `\n\n⏳ **Busy**`;
       if (getPendingPermission?.()) {
-        status += ` — permission en attente (envoie un message pour annuler)`;
+        status += ` — permission en attente`;
       }
     }
+    const queued = getQueueSize?.() ?? 0;
+    if (queued > 0) status += `\n📥 **File d'attente : ${queued}**`;
     await ctx.reply(status, { parse_mode: "Markdown" });
   };
 }
@@ -1426,7 +1427,8 @@ const helpHandler = async (ctx: Context) => {
     "/close - Close current session\n" +
     "/rename <title> - Rename session\n" +
     "/status - Show session info\n" +
-    "/abort - Cancel current prompt\n\n" +
+    "/abort - Cancel current prompt and clear the queue\n" +
+    "/retry - Retry the last prompt\n\n" +
     "**AI Configuration**\n" +
     "/model - Switch AI model\n" +
     "/mode - Switch agent mode\n" +
@@ -1485,13 +1487,7 @@ function todoHandler(tm?: TodoManager) {
 async function handleAcpNotification(
   msg: unknown,
   bot: Bot<Context>,
-  acpClient: AcpClient,
-  getProgressChatId: () => number | null,
-  getProgressMessageId: () => number | null,
-  setProgressMessageId: (id: number) => void,
   appendProgress: (t: string) => void,
-  getProgressText: () => string,
-  flushProgress: () => void,
   setPendingPermission: (p: { id: number; sessionId: string } | null) => void,
   toolCallMap: Map<string, { name: string; kind: string; input?: Record<string, unknown> }>,
   changedFiles: Set<string>,
@@ -1500,7 +1496,6 @@ async function handleAcpNotification(
   onTextChunk?: (text: string) => void,
   onThinkingChunk?: (text: string) => void,
   onUsage?: (usage: { inputTokens: number; outputTokens: number; cost: number }) => void,
-  onToolUpdate?: (summary: string) => void,
   onToolEntry?: (icon: string, label: string) => void,
 ): Promise<void> {
   const m = msg as Record<string, unknown>;
@@ -1563,7 +1558,6 @@ async function handleAcpNotification(
         logger.debug(`[Progress] chunk ${text.length} chars`);
         appendProgress(text);
         if (onTextChunk) onTextChunk(text);
-        flushProgress();
       } else {
         logger.debug("[ACP msg_chunk] no text", JSON.stringify(update).slice(0, 300));
       }
@@ -1612,11 +1606,6 @@ async function handleAcpNotification(
         const cmd = (input?.command || input?.code || "") as string;
         const label = fp ? `${toolName} ${fp.slice(0, 200)}` : cmd ? `${toolName} ${cmd.slice(0, 200)}` : toolName;
         onToolEntry(icon, label);
-      }
-      flushProgress();
-      if (onToolUpdate) {
-        const summary = buildToolSummary(toolCallMap);
-        onToolUpdate(summary);
       }
       return;
     }
@@ -1721,38 +1710,8 @@ async function replyWithFallback(ctx: Context, text: string): Promise<void> {
   }
 }
 
-function extractAgentText(result: Record<string, unknown> | undefined): string | undefined {
-  if (!result) return undefined;
-  // PromptResponse has stop_reason, usage – no text content
-  // The actual response comes via agent_message_chunk events
-  if (result.stopReason === "cancelled") return undefined;
-  return undefined;
-}
-
-/** Extract todo items from agent response – lines starting with "- [ ]" or "TODO:" */
-export function extractTodos(text: string): string[] {
-  const lines: string[] = [];
-  for (const line of text.split("\n")) {
-    const trimmed = line.trim();
-    // Match: - [ ] something, * [ ] something, TODO: something, - **TODO:** something
-    const m = trimmed.match(/^(?:[-*]\s+\[\s*\]\s*|TODO:\s*|-\s+\*\*TODO:\*\*\s*)(.+)/i);
-    if (m) lines.push(m[1]);
-  }
-  return lines;
-}
-
-function escapeHtml(text: string): string {
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
 function escapeMarkdown(text: string): string {
-  return text.replace(/([_*\[\]()~`>#+\-=|{}.!])/g, "\\$1");
-}
-
-function formatFileSizeStatic(bytes: number): string {
-  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
-  if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)}KB`;
-  return `${bytes}B`;
+  return text.replace(/([_*[\]()~`>#+\-=|{}.!])/g, "\\$1");
 }
 
 function formatToolInput(toolName: string, input: Record<string, unknown>): string {

@@ -1,5 +1,5 @@
 import { promises as fs } from 'node:fs';
-import { dirname, basename, join } from 'node:path';
+import { join } from 'node:path';
 
 export interface FileInfo {
   name: string;

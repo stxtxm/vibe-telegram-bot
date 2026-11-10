@@ -14,6 +14,18 @@ export interface PersistedSession {
   title?: string;
 }
 
+type ModelsState = NonNullable<SessionState["models"]>;
+type ModesState = NonNullable<SessionState["modes"]>;
+
+/** Shape of the responses returned by the ACP client (unknown at the protocol boundary). */
+interface SessionResponse {
+  sessionId?: string;
+  models?: ModelsState;
+  modes?: ModesState;
+  configOptions?: ACPConfigOption[];
+  sessions?: ACPSessionInfo[];
+}
+
 export class SessionManager {
   private client: AcpClient;
   private sessions = new Map<string, SessionState>();
@@ -62,7 +74,7 @@ export class SessionManager {
   }
 
   async loadSession(sessionId: string, cwd: string): Promise<string> {
-    const resp: any = await this.client.loadSession(sessionId, cwd);
+    const resp = await this.client.loadSession(sessionId, cwd) as SessionResponse | null;
     this.sessions.set(sessionId, {
       id: sessionId,
       cwd,
@@ -77,7 +89,7 @@ export class SessionManager {
   }
 
   async createSession(cwd: string): Promise<string> {
-    const resp: any = await this.client.newSession(cwd);
+    const resp = await this.client.newSession(cwd) as SessionResponse | null;
     if (!resp?.sessionId) throw new Error(`Invalid response: ${JSON.stringify(resp)}`);
     this.sessions.set(resp.sessionId, {
       id: resp.sessionId,
@@ -102,7 +114,7 @@ export class SessionManager {
 
   async syncRemoteSessions(): Promise<void> {
     try {
-      const resp: any = await this.client.listSessions();
+      const resp = await this.client.listSessions() as SessionResponse | null;
       const sessions = resp?.sessions ?? [];
       for (const s of sessions) {
         if (!this.sessions.has(s.sessionId)) {
@@ -119,7 +131,7 @@ export class SessionManager {
   }
 
   async setModel(sessionId: string, modelId: string): Promise<void> {
-    const resp: any = await this.client.setModel(sessionId, modelId);
+    const resp = await this.client.setModel(sessionId, modelId) as SessionResponse | null;
     if (resp === null) throw new Error(`Server refused model change to "${modelId}"`);
     const s = this.sessions.get(sessionId);
     if (s) {
@@ -132,7 +144,7 @@ export class SessionManager {
   }
 
   async setMode(sessionId: string, modeId: string): Promise<void> {
-    const resp: any = await this.client.setMode(sessionId, modeId);
+    const resp = await this.client.setMode(sessionId, modeId) as SessionResponse | null;
     if (resp === null) throw new Error(`Server refused mode change to "${modeId}"`);
     const s = this.sessions.get(sessionId);
     if (s) {
@@ -145,7 +157,7 @@ export class SessionManager {
   }
 
   async setConfigOption(sessionId: string, configId: string, value: string): Promise<void> {
-    const resp: any = await this.client.setConfigOption(sessionId, configId, value);
+    const resp = await this.client.setConfigOption(sessionId, configId, value) as SessionResponse | null;
     if (resp === null) throw new Error(`Server refused config change for "${configId}"`);
     const s = this.sessions.get(sessionId);
     if (s && resp?.configOptions) s.configOptions = resp.configOptions;
@@ -161,7 +173,7 @@ export class SessionManager {
   }
 
   async listSessions(): Promise<{ sessions: ACPSessionInfo[] }> {
-    const resp: any = await this.client.listSessions();
+    const resp = await this.client.listSessions() as SessionResponse | null;
     const sessions = resp?.sessions ?? [];
 
     for (const s of sessions) {

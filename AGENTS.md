@@ -34,6 +34,9 @@ Mistral Vibe CLI
 | `src/bot/index.ts` | Bot logic | `createBot()`, command handlers |
 | `src/bot/files.ts` | File navigation | `buildFileMenu()`, directory handling |
 | `src/bot/menus.ts` | UI menus | Inline keyboard builders |
+| `src/bot/stream.ts` | Response streaming | `ResponseStreamer` (thinking, tool entries, footer) |
+| `src/bot/keyboard.ts` | Persistent reply keyboard | `KeyboardManager` |
+| `src/bot/queue.ts` | Prompt queue | `PromptQueue` (FIFO for prompts received while busy) |
 | `src/acp/client.ts` | ACP client | `AcpClient` class, JSON-RPC |
 | `src/acp/session.ts` | Session management | `SessionManager` class |
 | `src/acp/auth.ts` | API key auth | `validateApiKey()`, `saveApiKey()`, `startSignIn()` |
@@ -42,6 +45,7 @@ Mistral Vibe CLI
 | `restart.sh` | Safe restart script | Wrapper for `systemd` restart |
 | `scripts/auth_start.py` | PKCE OAuth start | Generates sign-in URL |
 | `scripts/auth_complete.py` | OAuth polling | Exchanges code for token |
+| `eslint.config.js` | Lint configuration | Flat config, `typescript-eslint` recommended |
 
 ### Command Flow
 
@@ -133,8 +137,11 @@ Test files mirror the source structure:
 - `tests/acp-client.test.ts` - ACP client tests
 - `tests/bot.test.ts` - Bot command tests
 - `tests/files.test.ts` - File navigation tests
+- `tests/keyboard.test.ts` - Persistent reply keyboard tests
 - `tests/menus.test.ts` - Menu building tests
+- `tests/queue.test.ts` - Prompt queue tests
 - `tests/session-manager.test.ts` - Session management tests
+- `tests/stream.test.ts` - Response streaming tests
 - `tests/todo-manager.test.ts` - Todo management tests
 
 ### Environment Setup
@@ -256,7 +263,7 @@ The bot maintains a status message in the chat showing:
 - Tool call count and changed files
 - Busy/idle status
 
-The message is **not pinned** (fixed 2026-07-07). It's sent as a regular message and updated in-place via `editMessageText`. If the message is deleted, a new one is created on the next status update.
+The message is sent once, pinned quietly (`pinChatMessage` with `disable_notification`), then updated in-place via `editMessageText`. If editing fails (message deleted or unpinned), a new message is sent and pinned again.
 
 ### Important Considerations
 
@@ -267,7 +274,7 @@ The message is **not pinned** (fixed 2026-07-07). It's sent as a regular message
 5. **Progress Updates**: Progress messages are rate-limited (1 second minimum between updates)
 6. **Message Splitting**: Long messages are automatically split to fit Telegram's 4096 character limit
 7. **Typing Indicator**: `startTypingInterval` sends `sendChatAction(chatId, "typing")` every 4s while processing
-8. **Cancel + Retry**: When busy, a new user message cancels the current prompt (notification) and starts fresh
+8. **Prompt Queue**: When busy, a new user message is queued (`PromptQueue`) and starts automatically when the current prompt finishes; `/abort` cancels the prompt and clears the queue
 9. **Stale Guard**: A generation counter prevents stale prompt completions from showing errors or resetting state
 
 ### Process Safety - CRITICAL
@@ -358,11 +365,11 @@ Potential improvements:
 ### Useful Commands for Development
 
 ```bash
+# Lint (ESLint 9 flat config + typescript-eslint recommended)
+npm run lint
+
 # Type check without emitting
 npm run typecheck
-
-# Lint
-npm run lint
 
 # Build
 npm run build
@@ -370,7 +377,7 @@ npm run build
 # Run
 npm start
 
-# Development (build + start, watches)
+# Development (build then start — no watch)
 npm run dev
 
 # Test
@@ -383,11 +390,11 @@ rm -rf dist node_modules
 
 ---
 
-**Last Updated**: 2026-07-08
+**Last Updated**: 2026-11-10
 
 ### Session Summary (2026-07-08)
 
-**Problem**: The bot's systemd `.env` file (`/home/timo/dev/telegram-bots/vibe-telegram-bot/.env`) had an old/stale `MISTRAL_API_KEY='4t6fhE7MmsWQWwMwQUIJkeC80nlD1MR3'` (returns 401). This was loaded by systemd into `process.env.MISTRAL_API_KEY`. When the ACP client started, it checked `if (!env.MISTRAL_API_KEY)` — but it WAS set (stale) — so it never loaded the correct key from `~/.vibe/.env`. Key changes via `/setkey`, key-paste, or `/reauth` write to `~/.vibe/.env` but the ACP ignored it.
+**Problem**: The bot's systemd `.env` file (`/home/timo/dev/telegram-bots/vibe-telegram-bot/.env`) had an old/stale `MISTRAL_API_KEY='<redacted>'` (returns 401). This was loaded by systemd into `process.env.MISTRAL_API_KEY`. When the ACP client started, it checked `if (!env.MISTRAL_API_KEY)` — but it WAS set (stale) — so it never loaded the correct key from `~/.vibe/.env`. Key changes via `/setkey`, key-paste, or `/reauth` write to `~/.vibe/.env` but the ACP ignored it.
 
 **Fix 1** (`src/acp/client.ts:50-53`): ACP `start()` now **always** loads the key from `~/.vibe/.env` and uses it, regardless of `process.env.MISTRAL_API_KEY`. This makes `~/.vibe/.env` the single source of truth.
 

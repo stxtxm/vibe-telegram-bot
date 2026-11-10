@@ -19,6 +19,7 @@ vi.mock("grammy", () => {
       text: vi.fn().mockReturnThis(),
       row: vi.fn().mockReturnThis(),
       resized: vi.fn().mockReturnThis(),
+      persistent: vi.fn().mockReturnThis(),
     };
   });
   return {
@@ -34,10 +35,28 @@ vi.mock("grammy", () => {
 
 import { KeyboardManager } from "../src/bot/keyboard.js";
 import { Keyboard } from "grammy";
+import type { Bot, Context } from "grammy";
+
+type MockFn = ReturnType<typeof vi.fn>;
+
+interface MockBot {
+  api: {
+    sendMessage: MockFn;
+    deleteMessage: MockFn;
+  };
+}
 
 describe("KeyboardManager", () => {
-  let bot: any;
+  let bot: MockBot;
   let chatId: number;
+
+  function makeKm(): KeyboardManager {
+    return new KeyboardManager(bot as unknown as Bot<Context>, chatId);
+  }
+
+  function spyOnSend(km: KeyboardManager) {
+    return vi.spyOn(km as unknown as { sendKeyboardUpdate: () => Promise<void> }, "sendKeyboardUpdate");
+  }
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -56,7 +75,7 @@ describe("KeyboardManager", () => {
   });
 
   it("should initialize with default state", () => {
-    const km = new KeyboardManager(bot, chatId);
+    const km = makeKm();
     expect(km["state"]).toEqual({
       currentModel: "?",
       currentMode: "?",
@@ -68,7 +87,7 @@ describe("KeyboardManager", () => {
   });
 
   it("should update model and mode", () => {
-    const km = new KeyboardManager(bot, chatId);
+    const km = makeKm();
     km.updateModel("mistral-large");
     km.updateMode("agent");
     expect(km["state"].currentModel).toBe("mistral-large");
@@ -76,7 +95,7 @@ describe("KeyboardManager", () => {
   });
 
   it("should update usage", () => {
-    const km = new KeyboardManager(bot, chatId);
+    const km = makeKm();
     km.updateUsage(1500, 300, 0.025);
     expect(km["state"].inputTokens).toBe(1500);
     expect(km["state"].outputTokens).toBe(300);
@@ -84,20 +103,20 @@ describe("KeyboardManager", () => {
   });
 
   it("should update cwd", () => {
-    const km = new KeyboardManager(bot, chatId);
+    const km = makeKm();
     km.updateCwd("/home/user/project");
     expect(km["state"].sessionCwd).toBe("/home/user/project");
   });
 
   it("should format token count", () => {
-    const km = new KeyboardManager(bot, chatId);
+    const km = makeKm();
     expect(km["formatTokenCount"](500)).toBe("500");
     expect(km["formatTokenCount"](1500)).toBe("2K");
     expect(km["formatTokenCount"](1500000)).toBe("1.5M");
   });
 
   it("should truncate long paths", () => {
-    const km = new KeyboardManager(bot, chatId);
+    const km = makeKm();
     const longPath = "/home/user/very/long/path/to/project/src/components";
     const truncated = km["truncatePath"](longPath, 20);
     expect(truncated.length).toBeLessThanOrEqual(20);
@@ -105,7 +124,7 @@ describe("KeyboardManager", () => {
   });
 
   it("should build keyboard with state", () => {
-    const km = new KeyboardManager(bot, chatId);
+    const km = makeKm();
     km.updateModel("mistral-large");
     km.updateUsage(1500, 300, 0.025);
     km.updateCwd("/home/user/project");
@@ -117,8 +136,8 @@ describe("KeyboardManager", () => {
   });
 
   it("should debounce refreshKeyboard calls", () => {
-    const km = new KeyboardManager(bot, chatId);
-    const spy = vi.spyOn(km as any, "sendKeyboardUpdate");
+    const km = makeKm();
+    const spy = spyOnSend(km);
 
     km.refreshKeyboard();
     km.refreshKeyboard();
@@ -132,8 +151,8 @@ describe("KeyboardManager", () => {
   });
 
   it("should flushKeyboard immediately", () => {
-    const km = new KeyboardManager(bot, chatId);
-    const spy = vi.spyOn(km as any, "sendKeyboardUpdate");
+    const km = makeKm();
+    const spy = spyOnSend(km);
 
     km.refreshKeyboard();
     km.flushKeyboard();
@@ -141,26 +160,27 @@ describe("KeyboardManager", () => {
     expect(spy).toHaveBeenCalledTimes(1);
   });
 
-  it("should send and delete message on update", async () => {
-    const km = new KeyboardManager(bot, chatId);
+  it("should send persistent keyboard without deleting it", async () => {
+    const km = makeKm();
     await km["sendKeyboardUpdate"]();
 
     expect(bot.api.sendMessage).toHaveBeenCalledWith(
       chatId,
-      "⌨️",
+      "⌨️ clavier",
       expect.objectContaining({ disable_notification: true }),
     );
-    expect(bot.api.deleteMessage).toHaveBeenCalledWith(chatId, 42);
+    // Deleting the message would remove the persistent reply keyboard
+    expect(bot.api.deleteMessage).not.toHaveBeenCalled();
   });
 
   it("should handle send error gracefully", async () => {
     bot.api.sendMessage = vi.fn().mockRejectedValue(new Error("API error"));
-    const km = new KeyboardManager(bot, chatId);
+    const km = makeKm();
     await expect(km["sendKeyboardUpdate"]()).resolves.toBeUndefined();
   });
 
   it("should use zero cost label when cost is 0", () => {
-    const km = new KeyboardManager(bot, chatId);
+    const km = makeKm();
     const kb = km.buildKeyboard();
     expect(kb).toBeDefined();
   });

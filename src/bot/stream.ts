@@ -238,14 +238,6 @@ export class ResponseStreamer {
     this.state.usage = usage;
   }
 
-  setToolSummary(_text: string): void {
-    // Now shown in footer only
-  }
-
-  setProgressDone(): void {
-    // No-op
-  }
-
   async finalize(toolSummary: string, duration: string): Promise<void> {
     const s = this.state;
     if (!s) { logger.debug("[Stream] finalize: no state"); return; }
@@ -435,5 +427,5 @@ export function escapeHtml(text: string): string {
 }
 
 export function escapeMarkdown(text: string): string {
-  return text.replace(/([_*\[\]()~`>#+\-=|{}.!])/g, "\\$1");
+  return text.replace(/([_*[\]()~`>#+\-=|{}.!])/g, "\\$1");
 }

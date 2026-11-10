@@ -137,7 +137,7 @@ export class AcpClient {
 
       // Notification
       this.msgHandler?.(msg);
-    } catch (e) {
+    } catch {
       logger.warn("[ACP] parse error:", line.slice(0, 200));
     }
   }

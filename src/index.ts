@@ -153,7 +153,7 @@ async function main(): Promise<void> {
     }
   });
 
-  const keyValid = await ensureValidApiKey(async () => {
+  await ensureValidApiKey(async () => {
     // Key was renewed in background — restart ACP to pick it up
     if (!shuttingDown) {
       logger.info("[Auth] Restarting ACP with new API key...");

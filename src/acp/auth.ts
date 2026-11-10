@@ -40,7 +40,7 @@ export async function validateApiKey(key: string): Promise<boolean | null> {
 export async function startSignIn(): Promise<SignInAttempt> {
   logger.info("[Auth] Starting browser sign-in process...");
 
-  const { stdout, stderr } = await runPythonScript("auth_start.py", [STATE_FILE]);
+  const { stdout } = await runPythonScript("auth_start.py", [STATE_FILE]);
   const data = JSON.parse(stdout.trim());
 
   if (data.action === "error") {

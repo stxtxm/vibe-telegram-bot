@@ -1,8 +1,7 @@
 import { promises as fs } from 'node:fs';
-import { dirname, basename, join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { InlineKeyboard } from 'grammy';
-import { logger } from '../utils/logger.js';
-import { listDirectory, formatFileSize, type FileInfo } from '../utils/fs.js';
+import { listDirectory, formatFileSize } from '../utils/fs.js';
 import type { SessionManager } from '../acp/session.js';
 
 const ITEMS_PER_PAGE = 10;

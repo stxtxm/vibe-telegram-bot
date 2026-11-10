@@ -23,10 +23,25 @@ vi.mock("grammy", () => ({
 }));
 
 import { ResponseStreamer, splitMessage, escapeHtml, escapeMarkdown } from "../src/bot/stream.js";
-import { InlineKeyboard } from "grammy";
+import type { Bot, Context } from "grammy";
+
+type MockFn = ReturnType<typeof vi.fn>;
+
+interface MockBot {
+  api: {
+    sendMessage: MockFn;
+    editMessageText: MockFn;
+  };
+}
+
+// Tool entries are sent through the streamer's task queue, so give the
+// queued promises enough microtask turns to run before asserting.
+async function flushQueue(turns = 20): Promise<void> {
+  for (let i = 0; i < turns; i++) await Promise.resolve();
+}
 
 describe("ResponseStreamer", () => {
-  let bot: any;
+  let bot: MockBot;
   let chatId: number;
   let streamer: ResponseStreamer;
 
@@ -40,7 +55,7 @@ describe("ResponseStreamer", () => {
       },
     };
     chatId = 12345;
-    streamer = new ResponseStreamer(bot, chatId);
+    streamer = new ResponseStreamer(bot as unknown as Bot<Context>, chatId);
   });
 
   afterEach(() => {
@@ -117,6 +132,7 @@ describe("ResponseStreamer", () => {
     await streamer.start(1);
     expect(bot.api.sendMessage).toHaveBeenCalledTimes(1);
     streamer.addToolEntry("📖", "read src/index.ts");
+    await flushQueue();
     expect(bot.api.sendMessage).toHaveBeenCalledTimes(2);
     const call = bot.api.sendMessage.mock.calls[1];
     expect(call[0]).toBe(chatId);
@@ -127,6 +143,7 @@ describe("ResponseStreamer", () => {
     await streamer.start(1);
     streamer.addToolEntry("📖", "read a.ts");
     streamer.addToolEntry("💻", "ls -la");
+    await flushQueue();
     expect(bot.api.sendMessage).toHaveBeenCalledTimes(3);
     expect(streamer["state"]?.toolEntries).toHaveLength(2);
   });
@@ -200,7 +217,7 @@ describe("ResponseStreamer", () => {
     await streamer.finalize("", "5s");
 
     const footerCall = bot.api.sendMessage.mock.calls.find(
-      (c: any[]) => c[0] === chatId && typeof c[1] === "string" && c[1].includes("💰")
+      (c: unknown[]) => c[0] === chatId && typeof c[1] === "string" && c[1].includes("💰")
     );
     expect(footerCall).toBeDefined();
     expect(footerCall[1]).toContain("$0.0500");
@@ -212,7 +229,7 @@ describe("ResponseStreamer", () => {
     await streamer.finalize("", "5s");
 
     const footerCall = bot.api.sendMessage.mock.calls.find(
-      (c: any[]) => c[0] === chatId && typeof c[1] === "string" && (c[1].includes("⏱") || c[1].includes("⏱️"))
+      (c: unknown[]) => c[0] === chatId && typeof c[1] === "string" && (c[1].includes("⏱") || c[1].includes("⏱️"))
     );
     expect(footerCall).toBeDefined();
     expect(footerCall[1]).not.toContain("💰");

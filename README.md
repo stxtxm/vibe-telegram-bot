@@ -20,7 +20,7 @@ Le bot utilise le protocole **ACP (Agent Communication Protocol)** pour communiq
 - **Configuration IA** : Changez le modèle, le mode d'agent et le budget de réflexion à la volée
 - **Navigation fichiers** : Parcourez le système de fichiers de votre projet
 - **Todos persistants** : Gérez vos tâches avec une liste stockée sur disque
-- **Cancel + Retry** : Envoyez un nouveau message pendant que le bot réfléchit — il annule et repart
+- **File d'attente de prompts** : Les messages envoyés pendant qu'un prompt tourne sont mis en file et traités dans l'ordre ; `/abort` vide la file
 - **Session recovery** : Les sessions sont rechargées depuis le disque après un redémarrage du bot
 - **Typing indicator** : Le bot affiche "typing..." pendant qu'il traite votre message
 - **Markdown fallback** : Les messages sont envoyés en Markdown avec fallback automatique si le formatage casse
@@ -45,10 +45,16 @@ Le bot utilise le protocole **ACP (Agent Communication Protocol)** pour communiq
 | `/todo done <id>` | Toggle todo completion |
 | `/todo rm <id>` | Remove a todo |
 | `/todo clear` | Clear completed todos |
-| `/abort` | Cancel current prompt |
+| `/abort` | Cancel the current prompt and clear the queue |
+| `/retry` | Re-run the last prompt |
+| `/close` | Close current session |
+| `/plan` | Switch to plan mode |
+| `/compact` | Compress conversation context |
+| `/reauth` | Reconnect Mistral API (OAuth PKCE) |
+| `/setkey <key>` | Set Mistral API key manually |
 | `/help` | Show help message |
 
-Any text message is sent as a prompt to Vibe. If the bot is already processing a prompt, sending a new message cancels the current one and starts fresh.
+Any text message is sent as a prompt to Vibe. If the bot is already processing a prompt, the new message is queued and runs as soon as the current one finishes; `/abort` stops the running prompt and drops the queue.
 
 ## 📥 Installation
 
@@ -152,7 +158,7 @@ LOG_LEVEL=debug
 ```
 
 > 💡 **Conseils de configuration** :
-> - Pour autoriser plusieurs utilisateurs à accéder au bot, séparer les IDs par des virgules : `TELEGRAM_ALLOWED_USER_ID=123456789,987654321`
+> - Le bot est mono-utilisateur : `TELEGRAM_ALLOWED_USER_ID` doit contenir un seul ID numérique
 > - Assurez-vous que le répertoire `VIBE_PROJECT_DIR` existe et que le bot a les permissions d'écriture
 > - Utilisez `LOG_LEVEL=debug` pour obtenir des logs détaillés lors du développement
 
@@ -161,7 +167,7 @@ LOG_LEVEL=debug
 Vous avez deux options pour démarrer le bot :
 
 ```bash
-# Mode développement - avec compilation TypeScript et rechargement
+# Mode développement - compile puis démarre (pas de watch)
 npm run dev
 
 # Mode production - nécessite une compilation préalable
@@ -219,7 +225,7 @@ Telegram User -> Telegram Bot (grammy) <-> ACP Client <-> vibe-acp <-> Vibe
 
 ### Components
 - **Bot** (`src/bot/index.ts`) - Command handlers, ACP integration, typing indicator, message splitting, Markdown fallback
-- **ACP Client** (`src/acp/client.ts`) - Manages vibe-acp child process, JSON-RPC 2.0 communication, 30-min request timeout, session/load for recovery
+- **ACP Client** (`src/acp/client.ts`) - Manages vibe-acp child process, JSON-RPC 2.0 communication, no request timeout (prompts may run indefinitely), session/load for recovery
 - **Session Manager** (`src/acp/session.ts`) - In-memory session state, create/load/close/setModel/setMode/setConfigOption
 - **Todo Manager** (`src/todo.ts`) - Persistent todo list stored on disk
 - **Files** (`src/bot/files.ts`) - File system navigation with inline keyboard menus
@@ -233,17 +239,24 @@ vibe-telegram-bot/
 │   ├── config.ts
 │   ├── types.ts
 │   ├── acp/
+│   │   ├── auth.ts
 │   │   ├── client.ts
 │   │   ├── protocol.ts
 │   │   └── session.ts
 │   ├── bot/
 │   │   ├── index.ts
 │   │   ├── files.ts
-│   │   └── menus.ts
+│   │   ├── keyboard.ts
+│   │   ├── menus.ts
+│   │   ├── queue.ts
+│   │   └── stream.ts
 │   ├── todo.ts
 │   └── utils/
 │       ├── fs.ts
 │       └── logger.ts
+├── scripts/
+│   ├── auth_start.py
+│   └── auth_complete.py
 ├── tests/
 ├── .env.example
 ├── package.json
@@ -257,7 +270,7 @@ npm run dev      # Development mode
 npm run build    # Build only
 npm start        # Start production
 npm test         # Run tests
-npm run lint     # Linting
+npm run lint     # Linting (ESLint 9 + typescript-eslint)
 npm run typecheck # Type checking
 ```
 

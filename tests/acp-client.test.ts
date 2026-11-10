@@ -29,7 +29,7 @@ function makeMockProcess() {
   const proc = {
     stdin, stdout, stderr, pid: 12345, killed: false,
     kill: vi.fn(),
-    on: vi.fn((_event: string, _handler: (...args: unknown[]) => void) => proc),
+    on: vi.fn(() => proc),
   } as unknown as ChildProcess;
   mockSpawn.mockReturnValue(proc);
   return { proc, stdin, stdout, stderr };
@@ -61,8 +61,12 @@ describe("AcpClient", () => {
   });
 
   function receivedJson(): Record<string, unknown>[] {
-    const written = stdin.read() as Buffer | null;
-    if (!written) return [];
+    // read() may return a single buffered chunk, so drain the whole stream
+    const chunks: Buffer[] = [];
+    let chunk: Buffer | null;
+    while ((chunk = stdin.read() as Buffer | null) !== null) chunks.push(chunk);
+    const written = Buffer.concat(chunks);
+    if (written.length === 0) return [];
     return written
       .toString()
       .trim()

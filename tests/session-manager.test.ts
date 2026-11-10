@@ -8,7 +8,8 @@ vi.mock("../src/config.js", () => ({
   config: { vibe: { projectDir: "/default/project" } },
 }));
 
-import { SessionManager } from "../src/acp/session.js";
+import { SessionManager, type SessionState } from "../src/acp/session.js";
+import type { AcpClient } from "../src/acp/client.js";
 
 function createMockClient() {
   return {
@@ -52,7 +53,7 @@ describe("SessionManager", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     client = createMockClient();
-    sm = new SessionManager(client as any);
+    sm = new SessionManager(client as unknown as AcpClient);
   });
 
   describe("createSession", () => {
@@ -119,7 +120,7 @@ describe("SessionManager", () => {
         id: "ses-1", cwd: "/p",
         models: { availableModels: [{ modelId: "old", name: "Old" }], currentModelId: "old" },
         modes: { availableModes: [], currentModeId: "" },
-      } as any);
+      } as SessionState);
       sm.currentSessionId = "ses-1";
 
       client.setModel.mockResolvedValue({}); // Empty response — no models field
@@ -135,7 +136,7 @@ describe("SessionManager", () => {
       sm["sessions"].set("ses-1", {
         id: "ses-1", cwd: "/p",
         models: { availableModels: [], currentModelId: "old" },
-      } as any);
+      } as SessionState);
 
       client.setModel.mockResolvedValue({
         models: { availableModels: [{ modelId: "new", name: "New" }], currentModelId: "new" },
@@ -149,7 +150,7 @@ describe("SessionManager", () => {
     });
 
     it("should throw on null response (server refused)", async () => {
-      sm["sessions"].set("ses-1", { id: "ses-1", cwd: "/p" } as any);
+      sm["sessions"].set("ses-1", { id: "ses-1", cwd: "/p" } as SessionState);
       client.setModel.mockResolvedValue(null);
 
       await expect(sm.setModel("ses-1", "unknown")).rejects.toThrow("refused");
@@ -167,7 +168,7 @@ describe("SessionManager", () => {
         id: "ses-1", cwd: "/p",
         modes: { availableModes: [{ id: "old", name: "Old" }], currentModeId: "old" },
         models: { availableModels: [], currentModelId: "" },
-      } as any);
+      } as SessionState);
       sm.currentSessionId = "ses-1";
 
       client.setMode.mockResolvedValue({}); // Empty response — no modes field
@@ -183,7 +184,7 @@ describe("SessionManager", () => {
       sm["sessions"].set("ses-1", {
         id: "ses-1", cwd: "/p",
         modes: { availableModes: [], currentModeId: "old" },
-      } as any);
+      } as SessionState);
 
       client.setMode.mockResolvedValue({
         modes: { availableModes: [{ id: "new", name: "New" }], currentModeId: "new" },
@@ -197,7 +198,7 @@ describe("SessionManager", () => {
     });
 
     it("should throw on null response (server refused)", async () => {
-      sm["sessions"].set("ses-1", { id: "ses-1", cwd: "/p" } as any);
+      sm["sessions"].set("ses-1", { id: "ses-1", cwd: "/p" } as SessionState);
       client.setMode.mockResolvedValue(null);
 
       await expect(sm.setMode("ses-1", "unknown")).rejects.toThrow("refused");
@@ -209,7 +210,7 @@ describe("SessionManager", () => {
     });
 
     it("should not crash if session has no modes property yet", async () => {
-      sm["sessions"].set("ses-1", { id: "ses-1", cwd: "/p" } as any);
+      sm["sessions"].set("ses-1", { id: "ses-1", cwd: "/p" } as SessionState);
       client.setMode.mockResolvedValue({});
       await sm.setMode("ses-1", "agent");
       // Should not throw
@@ -221,7 +222,7 @@ describe("SessionManager", () => {
       const initialOptions = [
         { id: "thinking", name: "Thinking", type: "select", category: "general", currentValue: "off", options: [] },
       ];
-      sm["sessions"].set("ses-1", { id: "ses-1", cwd: "/p", configOptions: initialOptions } as any);
+      sm["sessions"].set("ses-1", { id: "ses-1", cwd: "/p", configOptions: initialOptions } as SessionState);
       client.setConfigOption.mockResolvedValue({
         configOptions: [
           { id: "thinking", name: "Thinking", type: "select", category: "general", currentValue: "high", options: [] },
@@ -236,7 +237,7 @@ describe("SessionManager", () => {
     });
 
     it("should throw on null response (server refused)", async () => {
-      sm["sessions"].set("ses-1", { id: "ses-1", cwd: "/p" } as any);
+      sm["sessions"].set("ses-1", { id: "ses-1", cwd: "/p" } as SessionState);
       client.setConfigOption.mockResolvedValue(null);
 
       await expect(sm.setConfigOption("ses-1", "bad_option", "x")).rejects.toThrow("refused");
@@ -245,7 +246,7 @@ describe("SessionManager", () => {
 
   describe("closeSession", () => {
     it("should call client.closeSession and remove local state", async () => {
-      sm["sessions"].set("ses-1", { id: "ses-1", cwd: "/p" } as any);
+      sm["sessions"].set("ses-1", { id: "ses-1", cwd: "/p" } as SessionState);
       sm.currentSessionId = "ses-1";
       client.closeSession.mockResolvedValue({});
 
@@ -257,8 +258,8 @@ describe("SessionManager", () => {
     });
 
     it("should not clear currentSessionId if closing different session", async () => {
-      sm["sessions"].set("ses-1", { id: "ses-1" } as any);
-      sm["sessions"].set("ses-2", { id: "ses-2" } as any);
+      sm["sessions"].set("ses-1", { id: "ses-1" } as SessionState);
+      sm["sessions"].set("ses-2", { id: "ses-2" } as SessionState);
       sm.currentSessionId = "ses-2";
       client.closeSession.mockResolvedValue({});
 
@@ -287,7 +288,7 @@ describe("SessionManager", () => {
     });
 
     it("should not overwrite existing local sessions", async () => {
-      sm["sessions"].set("ses-1", { id: "ses-1", cwd: "/local" } as any);
+      sm["sessions"].set("ses-1", { id: "ses-1", cwd: "/local" } as SessionState);
       client.listSessions.mockResolvedValue({
         sessions: [{ sessionId: "ses-1", cwd: "/remote", title: "Remote" }],
       });
@@ -300,7 +301,7 @@ describe("SessionManager", () => {
 
   describe("setTitle", () => {
     it("should call client.setTitle and update local title", async () => {
-      sm["sessions"].set("ses-1", { id: "ses-1", cwd: "/p" } as any);
+      sm["sessions"].set("ses-1", { id: "ses-1", cwd: "/p" } as SessionState);
       client.setTitle.mockResolvedValue({});
 
       await sm.setTitle("ses-1", "New Title");
@@ -322,7 +323,7 @@ describe("SessionManager", () => {
   describe("current", () => {
     it("should return current session or undefined", () => {
       expect(sm.current).toBeUndefined();
-      sm["sessions"].set("ses-1", { id: "ses-1", cwd: "/p" } as any);
+      sm["sessions"].set("ses-1", { id: "ses-1", cwd: "/p" } as SessionState);
       sm.currentSessionId = "ses-1";
       expect(sm.current).toBeDefined();
       expect(sm.current!.id).toBe("ses-1");

@@ -50,8 +50,13 @@ npm run dev
 ## Commands
 
 - `/start` - Create a Vibe session
-- `/new` - Create a new session
-- `/mode <name>` - Switch agent mode (plan, auto-approve, chat, etc.)
+- `/model`, `/mode`, `/thinking` - Configure the agent
+- `/plan` - Switch to plan mode
+- `/sessions`, `/close`, `/rename <title>` - Manage sessions
 - `/status` - Show current session
+- `/files`, `/cd <path>`, `/pwd` - Browse the project
+- `/todo` - Manage the todo list
+- `/abort`, `/compact` - Control the current prompt
+- `/reauth`, `/setkey <key>` - Manage the Mistral API key
 - `/help` - Show help
 - Any text message = prompt to Vibe
