@@ -139,9 +139,11 @@ import { createBot } from "../src/bot/index.js";
 function makeAcp() {
   const resolvers: Array<() => void> = [];
   const prompts: Array<{ sessionId: string; text: string }> = [];
+  const listeners: Array<(msg: unknown) => void> = [];
   return {
     resolvers,
     prompts,
+    listeners,
     // Each prompt stays pending until the test resolves it, like a long Vibe run.
     sendPrompt: vi.fn((sessionId: string, text: string) => {
       prompts.push({ sessionId, text });
@@ -156,7 +158,9 @@ function makeAcp() {
     initialize: vi.fn(async () => undefined),
     respondPermission: vi.fn(async () => undefined),
     respondPermissionError: vi.fn(async () => undefined),
-    onMessage: vi.fn(),
+    onMessage: vi.fn((listener: (msg: unknown) => void) => {
+      listeners.push(listener);
+    }),
     contextChars: 0,
     contextMessages: 0,
   };
@@ -306,6 +310,42 @@ describe("câblage FIFO de createBot", () => {
     const idle = await statusText();
     expect(idle).not.toContain("Busy");
     expect(idle).not.toContain("File d'attente");
+  });
+
+  it("/abort rejette une permission en attente", async () => {
+    await textHandler()(makeCtx("long").ctx);
+
+    const listener = acp.listeners[0];
+    if (!listener) throw new Error("onMessage handler not registered");
+    listener({
+      jsonrpc: "2.0",
+      id: 77,
+      method: "session/request_permission",
+      params: {
+        sessionId: "session-1",
+        toolCall: { toolCallId: "tc-1", name: "bash", kind: "bash" },
+        options: [
+          { optionId: "allow_once", name: "Autoriser une fois" },
+          { optionId: "deny", name: "Refuser" },
+        ],
+      },
+    });
+    await settle(10);
+
+    expect(acp.respondPermissionError).not.toHaveBeenCalled();
+    expect(await statusText()).toContain("permission en attente");
+
+    const abort = makeCtx("/abort");
+    await command("abort")(abort.ctx);
+
+    expect(acp.respondPermissionError).toHaveBeenCalledWith(77);
+    expect(acp.cancelPrompt).toHaveBeenCalledWith("session-1");
+    const afterAbort = await statusText();
+    expect(afterAbort).not.toContain("permission en attente");
+    expect(afterAbort).not.toContain("Busy");
+
+    acp.resolvers.shift()?.();
+    await settle();
   });
 
   it("/abort sans prompt en cours ne fait rien", async () => {
