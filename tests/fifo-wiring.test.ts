@@ -390,6 +390,62 @@ describe("câblage FIFO de createBot", () => {
     await settle();
   });
 
+  it("accepte une permission via le bouton et refuse un id périmé", async () => {
+    await textHandler()(makeCtx("long").ctx);
+
+    const listener = acp.listeners[0];
+    if (!listener) throw new Error("onMessage handler not registered");
+    listener({
+      jsonrpc: "2.0",
+      id: 79,
+      method: "session/request_permission",
+      params: {
+        sessionId: "session-1",
+        toolCall: { toolCallId: "tc-3", name: "bash", kind: "bash" },
+        options: [
+          { optionId: "allow_once", name: "Autoriser une fois" },
+          { optionId: "deny", name: "Refuser" },
+        ],
+      },
+    });
+    await settle(10);
+    expect(await statusText()).toContain("permission en attente");
+
+    const callback = h.callback();
+    if (!callback) throw new Error("callback handler not registered");
+    const acceptEdit = vi.fn(async () => true);
+    const acceptAnswer = vi.fn(async () => true);
+    await callback({
+      callbackQuery: { data: "perm:79:allow_once" },
+      from: { id: 12345 },
+      answerCallbackQuery: acceptAnswer,
+      editMessageText: acceptEdit,
+    });
+
+    expect(acp.respondPermission).toHaveBeenCalledWith(79, "allow_once");
+    expect(acp.respondPermissionError).not.toHaveBeenCalled();
+    expect(acceptAnswer).toHaveBeenCalled();
+    expect(acceptEdit).toHaveBeenCalledWith(expect.stringContaining("✅"));
+    expect(await statusText()).not.toContain("permission en attente");
+
+    // Le même bouton, une fois la permission consommée, doit être refusé.
+    const staleEdit = vi.fn(async () => true);
+    const staleAnswer = vi.fn(async () => true);
+    await callback({
+      callbackQuery: { data: "perm:79:allow_once" },
+      from: { id: 12345 },
+      answerCallbackQuery: staleAnswer,
+      editMessageText: staleEdit,
+    });
+
+    expect(acp.respondPermission).toHaveBeenCalledTimes(1);
+    expect(staleAnswer).toHaveBeenCalledWith({ text: "⏳ Expiré, envoie un message" });
+    expect(staleEdit).not.toHaveBeenCalled();
+
+    acp.resolvers.shift()?.();
+    await settle();
+  });
+
   it("/abort sans prompt en cours ne fait rien", async () => {
     const abort = makeCtx("/abort");
     await command("abort")(abort.ctx);
