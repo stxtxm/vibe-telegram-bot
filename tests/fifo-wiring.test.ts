@@ -596,6 +596,33 @@ describe("câblage FIFO de createBot", () => {
     expect(await statusText()).not.toContain("Busy");
   });
 
+  it("redémarre l'ACP en dernier recours si la session reste introuvable", async () => {
+    await textHandler()(makeCtx("premier").ctx);
+
+    sm.loadSession.mockRejectedValueOnce(new Error("cannot load session"));
+    sm.createSession
+      .mockRejectedValueOnce(new Error("cannot create session"))
+      .mockResolvedValueOnce("session-3");
+
+    acp.resolvers.shift()?.(new Error("Session not found"));
+
+    await vi.waitFor(() => expect(acp.prompts).toHaveLength(2), { timeout: 4000 });
+    expect(sm.createSession).toHaveBeenCalledTimes(2);
+    expect(acp.stop).toHaveBeenCalledWith(true);
+    expect(acp.start).toHaveBeenCalled();
+    expect(acp.initialize).toHaveBeenCalled();
+    expect(acp.prompts[1]).toEqual({ sessionId: "session-3", text: "premier" });
+
+    const sent = h.api.sendMessage.mock.calls.map(([, text]) => text).join("\n");
+    expect(sent).toContain("Réparation automatique");
+
+    acp.resolvers.shift()?.();
+    await vi.waitFor(() => expect(h.streamer.finalize).toHaveBeenCalled(), { timeout: 3000 });
+    await settle();
+
+    expect(await statusText()).not.toContain("Busy");
+  });
+
   it("/abort sans prompt en cours ne fait rien", async () => {
     const abort = makeCtx("/abort");
     await command("abort")(abort.ctx);
