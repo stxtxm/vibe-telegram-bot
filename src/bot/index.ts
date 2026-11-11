@@ -37,6 +37,7 @@ import {
   buildModelMenu, buildModeMenu, buildThinkingMenu, buildSessionList, buildQuestionMenu,
   isModelSelect, isModeSelect, isThinkingSelect, isSessionSelect, isSessionPage, isMenuCancel, isFileAction, isQuestionSelect,
   parseModelData, parseModeData, parseThinkingData, parseSessionSelect, parseSessionPage, parseQuestionData,
+  QUESTION_CUSTOM, QUESTION_SKIP,
 } from "./menus.js";
 import { KeyboardManager } from "./keyboard.js";
 import { ResponseStreamer } from "./stream.js";
@@ -113,7 +114,9 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
   const toolCountWrapper = { n: 0 };
 
   // Active question state
-  let activeQuestion: { sessionId: string; questionIndex: number; options: string[]; messageId: number | null } | null = null;
+  let activeQuestion: { sessionId: string; qid: string; options: string[]; messageId: number | null; awaitingCustom: boolean } | null = null;
+  let questionSeq = 0;
+  const QUESTION_SKIP_PHRASE = "Passe cette question et continue avec ton meilleur jugement.";
 
   // Pending file upload state
   let pendingUpload: string | null = null;
@@ -932,27 +935,41 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
         }),
         (msg) => ctx.answerCallbackQuery({ text: msg }).catch(() => {}),
         (msg) => ctx.reply(msg, { parse_mode: "Markdown" }),
-        () => requestPinnedUpdate(true),
+        () => { void updatePinnedMessage(); },
       );
       return;
     }
 
     // Question response
     if (isQuestionSelect(data)) {
-      const { questionIndex, optionIndex } = parseQuestionData(data);
-      if (!activeQuestion || activeQuestion.questionIndex !== questionIndex) {
+      const { qid, option } = parseQuestionData(data);
+      if (!activeQuestion || activeQuestion.qid !== qid) {
         await ctx.answerCallbackQuery({ text: "⏳ Question expirée" }).catch(() => {});
         return;
       }
       await ctx.answerCallbackQuery().catch(() => {});
-      const answerText = activeQuestion.options[optionIndex];
+      if (option === QUESTION_CUSTOM) {
+        activeQuestion.awaitingCustom = true;
+        await ctx.editMessageText(
+          `❓ Écris ta réponse en message.`,
+        ).catch(() => {});
+        return;
+      }
+      let answerText: string | undefined;
+      if (option === QUESTION_SKIP) {
+        answerText = QUESTION_SKIP_PHRASE;
+      } else {
+        const idx = parseInt(option, 10);
+        answerText = Number.isFinite(idx) ? activeQuestion.options[idx] : undefined;
+      }
       if (answerText && activeQuestion.sessionId) {
-        logger.info(`[Question] Answering idx=${optionIndex} with "${answerText}"`);
+        logger.info(`[Question] Answering ${qid} with "${answerText.slice(0, 80)}"`);
         acpClient.sendPrompt(activeQuestion.sessionId, answerText).catch((err) => {
           logger.error("[Question] Failed to send answer:", err);
         });
       }
-      await ctx.editMessageText(`✅ ${answerText}`).catch(() => {});
+      const cardNote = option === QUESTION_SKIP ? "⏭️ Décision laissée à l'agent" : `✅ ${(answerText || "").slice(0, 200)}`;
+      await ctx.editMessageText(cardNote).catch(() => {});
       activeQuestion = null;
       return;
     }
@@ -983,10 +1000,13 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
       }
     }, toolCallMap, changedFiles, toolCountWrapper, (sessionId: string, questionText: string, options: string[]) => {
       // Interactive question — show inline menu
-      const menu = buildQuestionMenu(Date.now(), questionText, options);
+      const qid = `q${++questionSeq}`;
+      const menu = buildQuestionMenu(qid, questionText, options);
       const chatId = config.telegram.allowedUserId;
-      bot.api.sendMessage(chatId, menu.text, { parse_mode: "Markdown", reply_markup: menu.keyboard }).catch(() => {});
-      activeQuestion = { sessionId, questionIndex: Date.now(), options, messageId: null };
+      activeQuestion = { sessionId, qid, options, messageId: null, awaitingCustom: false };
+      bot.api.sendMessage(chatId, menu.text, { parse_mode: "Markdown", reply_markup: menu.keyboard }).then((sent) => {
+        if (activeQuestion && activeQuestion.qid === qid) activeQuestion.messageId = sent.message_id;
+      }).catch(() => {});
     }, (text) => {
       if (isCompacting) return;
       responseStreamer.contextChars = acpClient.contextChars;
