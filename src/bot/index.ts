@@ -493,7 +493,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     }
   });
 
-  async function runPrompt(acpClient: AcpClient, ctx: Context, sid: string, generation: number, stopTyping?: () => void, retry = 0, upload: string | null = null) {
+  async function runPrompt(acpClient: AcpClient, ctx: Context, sid: string, generation: number, stopTyping?: () => void, retry = 0, upload: string | null = null, prefix?: string) {
     const text = ctx.message?.text;
     if (!text) {
       stopTyping?.();
@@ -510,6 +510,9 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
         : upload;
       effectiveText = `[File uploaded to ${relPath}]\n\n${cleanText}`;
     }
+    // A retry re-sends the prompt with a marker the model can see; runPrompt
+    // rebuilds the text from ctx, so the marker has to be passed in.
+    if (prefix) effectiveText = `${prefix}\n\n${effectiveText}`;
     let recovered = false;
     try {
       // Auto-compact if context exceeds threshold - fixed to not modify session title and not block
@@ -637,8 +640,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
             return;
           }
           recovered = true;
-          effectiveText = `[retry after auth error]\n\n${effectiveText}`;
-          await runPrompt(acpClient, ctx, sid, generation, stopTyping, retry + 1, upload);
+          await runPrompt(acpClient, ctx, sid, generation, stopTyping, retry + 1, upload, "[retry after auth error]");
           return;
         }
         logger.error("[Bot] Auth error — permanent after retry:", msg);
@@ -663,8 +665,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
         await ctx.reply(`🔄 **Erreur API** (PoolTimeout). Nouvelle tentative dans ${backoff / 1000}s... (tentative ${retry + 1}/${MAX_PROMPT_RETRIES})`);
         await new Promise(r => setTimeout(r, backoff));
         recovered = true;
-        effectiveText = `[retry after timeout]\n\n${effectiveText}`;
-        await runPrompt(acpClient, ctx, sid, generation, stopTyping, retry + 1, upload);
+        await runPrompt(acpClient, ctx, sid, generation, stopTyping, retry + 1, upload, "[retry after timeout]");
         return;
       }
 

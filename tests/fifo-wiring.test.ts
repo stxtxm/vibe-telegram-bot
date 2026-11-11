@@ -521,9 +521,7 @@ describe("câblage FIFO de createBot", () => {
     acp.resolvers.shift()?.(new Error("Unauthorized: invalid api key"));
 
     await vi.waitFor(() => expect(acp.prompts).toHaveLength(2), { timeout: 4000 });
-    // runPrompt reconstruit le texte depuis ctx : le préfixe [retry after auth error]
-    // assigné dans le catch n'est pas transmis à la tentative suivante.
-    expect(acp.prompts[1].text).toBe("premier");
+    expect(acp.prompts[1].text).toBe("[retry after auth error]\n\npremier");
     expect(acp.stop).toHaveBeenCalledWith(true);
     expect(acp.start).toHaveBeenCalled();
     expect(acp.initialize).toHaveBeenCalled();
@@ -537,6 +535,21 @@ describe("câblage FIFO de createBot", () => {
     await settle();
 
     expect(await statusText()).not.toContain("Busy");
+  });
+
+  it("préfixe la relance d'une erreur API retryable", async () => {
+    await textHandler()(makeCtx("premier").ctx);
+
+    acp.resolvers.shift()?.(new Error("PoolTimeout"));
+
+    await vi.waitFor(() => expect(acp.prompts).toHaveLength(2), { timeout: 4000 });
+    expect(acp.prompts[1].text).toBe("[retry after timeout]\n\npremier");
+    const sent = h.api.sendMessage.mock.calls.map(([, text]) => text).join("\n");
+    expect(sent).toContain("Nouvelle tentative dans 1s");
+
+    acp.resolvers.shift()?.();
+    await vi.waitFor(() => expect(h.streamer.finalize).toHaveBeenCalled(), { timeout: 3000 });
+    await settle();
   });
 
   it("/abort sans prompt en cours ne fait rien", async () => {
