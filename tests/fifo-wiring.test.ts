@@ -202,6 +202,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   if (uploadedFile) {
     await fs.rm(uploadedFile, { force: true });
@@ -343,6 +344,47 @@ describe("câblage FIFO de createBot", () => {
     const afterAbort = await statusText();
     expect(afterAbort).not.toContain("permission en attente");
     expect(afterAbort).not.toContain("Busy");
+
+    acp.resolvers.shift()?.();
+    await settle();
+  });
+
+  it("auto-rejette une permission après le timeout de 10 minutes", async () => {
+    await textHandler()(makeCtx("long").ctx);
+
+    const listener = acp.listeners[0];
+    if (!listener) throw new Error("onMessage handler not registered");
+
+    vi.useFakeTimers();
+    try {
+      listener({
+        jsonrpc: "2.0",
+        id: 78,
+        method: "session/request_permission",
+        params: {
+          sessionId: "session-1",
+          toolCall: { toolCallId: "tc-2", name: "write", kind: "write" },
+          options: [{ optionId: "allow_once", name: "Autoriser une fois" }],
+        },
+      });
+      await Promise.resolve();
+
+      expect(acp.respondPermissionError).not.toHaveBeenCalled();
+      expect(await statusText()).toContain("permission en attente");
+
+      vi.advanceTimersByTime(600_000);
+
+      expect(acp.respondPermissionError).toHaveBeenCalledWith(78);
+      expect(h.api.sendMessage).toHaveBeenCalledWith(12345, expect.stringContaining("expirée"));
+      // Le timeout ne fait que rejeter la permission : le prompt continue.
+      expect(acp.cancelPrompt).not.toHaveBeenCalled();
+
+      const afterTimeout = await statusText();
+      expect(afterTimeout).not.toContain("permission en attente");
+      expect(afterTimeout).toContain("Busy");
+    } finally {
+      vi.useRealTimers();
+    }
 
     acp.resolvers.shift()?.();
     await settle();
