@@ -650,6 +650,29 @@ describe("câblage FIFO de createBot", () => {
     expect(await statusText()).not.toContain("Busy");
   });
 
+  it("ignore un prompt concurrent sans nouvelle tentative et continue la file", async () => {
+    await textHandler()(makeCtx("premier").ctx);
+    await textHandler()(makeCtx("deuxieme").ctx);
+
+    acp.resolvers.shift()?.(new Error("Concurrent prompts detected"));
+
+    await vi.waitFor(() => expect(acp.prompts).toHaveLength(2), { timeout: 4000 });
+    // Pas de retry du prompt concurrent : c'est le message en file qui démarre.
+    expect(acp.prompts[1].text).toBe("deuxieme");
+    expect(acp.stop).not.toHaveBeenCalled();
+    expect(h.streamer.abort).not.toHaveBeenCalled();
+
+    const sent = h.api.sendMessage.mock.calls.map(([, text]) => text).join("\n");
+    expect(sent).toContain("Déjà occupé");
+
+    acp.resolvers.shift()?.();
+    await settle();
+
+    const idle = await statusText();
+    expect(idle).not.toContain("Busy");
+    expect(idle).not.toContain("File d'attente");
+  });
+
   it("/abort sans prompt en cours ne fait rien", async () => {
     const abort = makeCtx("/abort");
     await command("abort")(abort.ctx);
