@@ -446,6 +446,45 @@ describe("câblage FIFO de createBot", () => {
     await settle();
   });
 
+  it("affiche une erreur si respondPermission échoue au clic", async () => {
+    await textHandler()(makeCtx("long").ctx);
+
+    const listener = acp.listeners[0];
+    if (!listener) throw new Error("onMessage handler not registered");
+    listener({
+      jsonrpc: "2.0",
+      id: 80,
+      method: "session/request_permission",
+      params: {
+        sessionId: "session-1",
+        toolCall: { toolCallId: "tc-4", name: "bash", kind: "bash" },
+        options: [{ optionId: "allow_once", name: "Autoriser une fois" }],
+      },
+    });
+    await settle(10);
+
+    acp.respondPermission.mockRejectedValueOnce(new Error("rpc failed"));
+
+    const callback = h.callback();
+    if (!callback) throw new Error("callback handler not registered");
+    const editMessageText = vi.fn(async () => true);
+    const answerCallbackQuery = vi.fn(async () => true);
+    await callback({
+      callbackQuery: { data: "perm:80:allow_once" },
+      from: { id: 12345 },
+      answerCallbackQuery,
+      editMessageText,
+    });
+
+    expect(answerCallbackQuery).toHaveBeenCalled();
+    expect(editMessageText).toHaveBeenCalledWith("❌ Error: rpc failed");
+    // L'état est purgé même si la réponse ACP a échoué.
+    expect(await statusText()).not.toContain("permission en attente");
+
+    acp.resolvers.shift()?.();
+    await settle();
+  });
+
   it("/abort sans prompt en cours ne fait rien", async () => {
     const abort = makeCtx("/abort");
     await command("abort")(abort.ctx);
