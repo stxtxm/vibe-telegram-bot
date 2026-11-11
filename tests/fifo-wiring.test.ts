@@ -552,6 +552,26 @@ describe("câblage FIFO de createBot", () => {
     await settle();
   });
 
+  it("recharge la session quand l'ACP répond « Session not found »", async () => {
+    await textHandler()(makeCtx("premier").ctx);
+
+    acp.resolvers.shift()?.(new Error("Session not found"));
+
+    await vi.waitFor(() => expect(acp.prompts).toHaveLength(2), { timeout: 4000 });
+    expect(sm.loadSession).toHaveBeenCalledWith("session-1", "/project");
+    expect(sm.createSession).not.toHaveBeenCalled();
+    expect(acp.prompts[1]).toEqual({ sessionId: "session-1", text: "premier" });
+
+    const sent = h.api.sendMessage.mock.calls.map(([, text]) => text).join("\n");
+    expect(sent).toContain("Session rechargée");
+
+    acp.resolvers.shift()?.();
+    await vi.waitFor(() => expect(h.streamer.finalize).toHaveBeenCalled(), { timeout: 3000 });
+    await settle();
+
+    expect(await statusText()).not.toContain("Busy");
+  });
+
   it("/abort sans prompt en cours ne fait rien", async () => {
     const abort = makeCtx("/abort");
     await command("abort")(abort.ctx);
