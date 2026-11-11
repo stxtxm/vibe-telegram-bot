@@ -931,7 +931,8 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
           reply_markup: menu.keyboard,
         }),
         (msg) => ctx.answerCallbackQuery({ text: msg }).catch(() => {}),
-        (msg) => ctx.reply(msg, { parse_mode: "Markdown" })
+        (msg) => ctx.reply(msg, { parse_mode: "Markdown" }),
+        () => requestPinnedUpdate(true),
       );
       return;
     }
@@ -1076,10 +1077,26 @@ function cdHandler(sm: SessionManager) {
       return;
     }
 
-    // Otherwise, change directory as before
+    // Change directory => create a new session in that directory (option B)
     try {
-      const newPath = await changeDirectory(sm, sid, pathArg);
-      await ctx.reply(`✅ Changed directory to \`${newPath}\``, { parse_mode: "Markdown" });
+      const session = sm.getSession(sid);
+      let resolvedPath: string;
+      if (pathArg.startsWith('/')) {
+        resolvedPath = pathArg;
+      } else {
+        resolvedPath = join(session?.cwd || config.vibe.projectDir, pathArg);
+      }
+      const stats = await fs.stat(resolvedPath);
+      if (!stats.isDirectory()) {
+        await ctx.reply(`❌ \`${resolvedPath}\` n'est pas un dossier`, { parse_mode: "Markdown" });
+        return;
+      }
+      await sm.createSession(resolvedPath);
+      const s = sm.current;
+      await ctx.reply(
+        `✅ **Nouvelle session créée**\n📍 Dossier : \`${s?.cwd || resolvedPath}\``,
+        { parse_mode: "Markdown" },
+      );
     } catch (err) {
       await ctx.reply(`❌ ${err instanceof Error ? err.message : String(err)}`, { parse_mode: "Markdown" });
     }
@@ -1113,6 +1130,7 @@ async function handleFileCallback(
   editMessage: (menu: { text: string; keyboard: InlineKeyboard }) => Promise<unknown>,
   answerCallback: (text: string) => Promise<unknown>,
   sendMessage: (text: string) => Promise<unknown>,
+  onSessionChanged?: () => void,
 ) {
   const { action: act, path, sessionId: sid, page = 0 } = action;
   const effectiveSid = sid || sm.currentSessionId;
@@ -1146,9 +1164,23 @@ async function handleFileCallback(
         const stats = await fs.stat(path);
         if (!stats.isDirectory()) { return; }
         await sm.updateCwd(effectiveSid, path);
-        acpClient.setConfigOption(effectiveSid, 'cwd', path).catch(() => {});
         await ctx.deleteMessage().catch(() => {});
-        await ctx.reply(`✅ Session directory changed to \`${path}\``, { parse_mode: "Markdown" });
+        await ctx.reply(`✅ Dossier de la session (conservée) : \`${path}\``, { parse_mode: "Markdown" });
+        onSessionChanged?.();
+        break;
+      }
+
+      case 'new_session_here': {
+        const stats = await fs.stat(path);
+        if (!stats.isDirectory()) { return; }
+        await sm.createSession(path);
+        const s = sm.current;
+        await ctx.deleteMessage().catch(() => {});
+        await ctx.reply(
+          `✅ **Nouvelle session créée**\n📍 Dossier : \`${s?.cwd || path}\``,
+          { parse_mode: "Markdown" },
+        );
+        onSessionChanged?.();
         break;
       }
 

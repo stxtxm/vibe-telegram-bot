@@ -159,25 +159,35 @@ describe("buildSessionList", () => {
 
 describe("Question menu", () => {
   it("should build question menu with options", () => {
-    const menu = buildQuestionMenu(0, "What color?", ["Red", "Blue", "Green"]);
+    const menu = buildQuestionMenu("q1", "What color?", ["Red", "Blue", "Green"]);
     expect(menu.text).toContain("What color?");
     expect(menu.keyboard).toBeDefined();
   });
 
   it("should handle empty options", () => {
-    const menu = buildQuestionMenu(0, "Empty?", []);
+    const menu = buildQuestionMenu("q2", "Empty?", []);
     expect(menu.text).toContain("Empty?");
     expect(menu.keyboard).toBeDefined();
   });
 
+  it("should truncate very long option labels", () => {
+    const menu = buildQuestionMenu("q3", "Pick?", ["x".repeat(100)]);
+    expect(menu.keyboard).toBeDefined();
+  });
+
   it("should parse question callback", () => {
-    const result = parseQuestionData("question:1:2");
-    expect(result.questionIndex).toBe(1);
-    expect(result.optionIndex).toBe(2);
+    const result = parseQuestionData("question:q12:2");
+    expect(result.qid).toBe("q12");
+    expect(result.option).toBe("2");
+  });
+
+  it("should parse custom/skip actions", () => {
+    expect(parseQuestionData("question:q1:custom").option).toBe("custom");
+    expect(parseQuestionData("question:q1:skip").option).toBe("skip");
   });
 
   it("should detect question callback", () => {
-    expect(isQuestionSelect("question:0:0")).toBe(true);
+    expect(isQuestionSelect("question:q1:0")).toBe(true);
     expect(isQuestionSelect("model:x")).toBe(false);
   });
 });

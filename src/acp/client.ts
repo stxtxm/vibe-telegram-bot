@@ -32,6 +32,7 @@ export class AcpClient {
   private _contextMessages = 0;
   private _skipNextAutoRestart = false;
   private _initialized = false;
+  private _suppressNotifications = 0;
 
   get contextChars(): number { return this._contextChars; }
   get contextMessages(): number { return this._contextMessages; }
@@ -136,7 +137,9 @@ export class AcpClient {
       }
 
       // Notification
-      this.msgHandler?.(msg);
+      if (this._suppressNotifications === 0) {
+        this.msgHandler?.(msg);
+      }
     } catch {
       logger.warn("[ACP] parse error:", line.slice(0, 200));
     }
@@ -149,22 +152,27 @@ export class AcpClient {
     this.pending.clear();
   }
 
-  private async request(method: string, params?: Record<string, unknown>): Promise<unknown> {
+  private async request(method: string, params?: Record<string, unknown>, opts?: { suppressNotifications?: boolean }): Promise<unknown> {
     const id = this.nextId++;
-    return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      this.proc?.stdin?.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    if (opts?.suppressNotifications) this._suppressNotifications++;
+    try {
+      return await new Promise((resolve, reject) => {
+        this.pending.set(id, { resolve, reject });
+        this.proc?.stdin?.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
 
-      if (REQUEST_TIMEOUT > 0) {
-        setTimeout(() => {
-          const cb = this.pending.get(id);
-          if (cb) {
-            this.pending.delete(id);
-            cb.reject(new Error(`ACP request timeout: ${method}`));
-          }
-        }, REQUEST_TIMEOUT);
-      }
-    });
+        if (REQUEST_TIMEOUT > 0) {
+          setTimeout(() => {
+            const cb = this.pending.get(id);
+            if (cb) {
+              this.pending.delete(id);
+              cb.reject(new Error(`ACP request timeout: ${method}`));
+            }
+          }, REQUEST_TIMEOUT);
+        }
+      });
+    } finally {
+      if (opts?.suppressNotifications) this._suppressNotifications--;
+    }
   }
 
   private sendNotification(method: string, params?: Record<string, unknown>): void {
@@ -197,9 +205,9 @@ export class AcpClient {
     return this.request("session/new", { cwd, mcpServers: [] });
   }
 
-  async loadSession(sessionId: string, cwd: string): Promise<unknown> {
+  async loadSession(sessionId: string, cwd: string, opts?: { silent?: boolean }): Promise<unknown> {
     logger.info(`[ACP] loadSession ${sessionId.slice(0, 8)}...`);
-    return this.request("session/load", { sessionId, cwd, mcpServers: [] });
+    return this.request("session/load", { sessionId, cwd, mcpServers: [] }, { suppressNotifications: opts?.silent });
   }
 
   async setModel(sessionId: string, modelId: string): Promise<unknown> {

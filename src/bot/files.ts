@@ -50,6 +50,14 @@ export function parseFileAction(data: string): FileAction | null {
     return { action: 'set_cwd', path, sessionId };
   }
 
+  if (action === 'c') {
+    const sessionId = parts[2];
+    const idx = parseInt(parts[3], 10);
+    const path = pathMap.get(idx);
+    if (!path) return null;
+    return { action: 'new_session_here', path, sessionId };
+  }
+
   if (action === 'g') {
     const page = parseInt(parts[2], 10);
     const idx = parseInt(parts[3], 10);
@@ -129,9 +137,10 @@ export async function buildFileMenu(
     }
   }
 
-  // Set as session dir
+  // Session directory actions
   if (sessionId) {
-    kb.text('🗂️ Set as Session Dir', `f:s:${sessionId}:${storePath(currentPath)}`).row();
+    kb.text('🆕 New session here', `f:c:${sessionId}:${storePath(currentPath)}`).row();
+    kb.text('🗂️ Use this dir (keep session)', `f:s:${sessionId}:${storePath(currentPath)}`).row();
   }
   kb.text('❌ Close', 'f:x').row();
 

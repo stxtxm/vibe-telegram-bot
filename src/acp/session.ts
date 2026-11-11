@@ -73,17 +73,25 @@ export class SessionManager {
     return this.currentId ? this.sessions.get(this.currentId) : undefined;
   }
 
-  async loadSession(sessionId: string, cwd: string): Promise<string> {
-    const resp = await this.client.loadSession(sessionId, cwd) as SessionResponse | null;
+  async loadSession(sessionId: string, cwd: string, opts?: { silent?: boolean; preserveCurrent?: boolean }): Promise<string> {
+    const resp = (opts?.silent
+      ? await this.client.loadSession(sessionId, cwd, { silent: true })
+      : await this.client.loadSession(sessionId, cwd)) as SessionResponse | null;
+    const prev = this.sessions.get(sessionId);
     this.sessions.set(sessionId, {
       id: sessionId,
       cwd,
-      models: resp?.models,
-      modes: resp?.modes,
-      configOptions: resp?.configOptions,
+      title: prev?.title,
+      models: resp?.models ?? prev?.models,
+      modes: resp?.modes ?? prev?.modes,
+      configOptions: resp?.configOptions ?? prev?.configOptions,
     });
-    this.currentId = sessionId;
-    await this.saveLastSession();
+    if (!opts?.preserveCurrent || this.currentId === sessionId) {
+      this.currentId = sessionId;
+    }
+    if (this.currentId === sessionId) {
+      await this.saveLastSession();
+    }
     logger.info(`[Session] loaded ${sessionId.slice(0, 8)}...`);
     return sessionId;
   }
@@ -105,10 +113,19 @@ export class SessionManager {
   }
 
   async updateCwd(sessionId: string, newCwd: string): Promise<void> {
-    const s = this.sessions.get(sessionId);
-    if (s) s.cwd = newCwd;
-    if (this.currentId === sessionId) {
-      await this.saveLastSession();
+    // vibe-acp has no session cwd config option; it sets cwd on session/load (and session/new).
+    // Reload the session in the new directory so the agent actually runs there.
+    // silent=true suppresses history-replay notifications that would pollute the UI/streamer.
+    try {
+      await this.loadSession(sessionId, newCwd, { silent: true, preserveCurrent: this.currentId !== sessionId });
+      logger.info(`[Session] cwd updated via reload: ${sessionId.slice(0, 8)}... -> ${newCwd}`);
+    } catch (err) {
+      // Fallback: persist locally so at least restart restores the intended directory
+      const s = this.sessions.get(sessionId);
+      if (s) s.cwd = newCwd;
+      if (this.currentId === sessionId) await this.saveLastSession();
+      logger.warn(`[Session] cwd reload failed, saved locally: ${err instanceof Error ? err.message : String(err)}`);
+      throw err;
     }
   }
 
