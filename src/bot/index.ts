@@ -94,6 +94,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
   // Prompts received while busy wait here instead of cancelling the running one
   const promptQueue = new PromptQueue();
   let lastPromptText: string | null = null;
+  let lastPromptUpload: string | null = null;
   let progressChatId: number | null = null;
   let progressMessageId: number | null = null;
   let progressText = "";
@@ -150,7 +151,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     const generation = ++promptGeneration;
     busy = true;
     lastPromptText = job.text;
-    pendingUpload = job.upload ?? null;
+    lastPromptUpload = job.upload ?? null;
     progressText = "";
     toolCallMap = new Map();
     changedFiles.clear();
@@ -163,7 +164,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     progressChatId = job.chatId;
     const stopTyping = startTypingInterval(job.chatId);
 
-    runPrompt(acpClient, jobContext(job), sid, generation, stopTyping).catch((err) => {
+    runPrompt(acpClient, jobContext(job), sid, generation, stopTyping, 0, job.upload ?? null).catch((err) => {
       logger.error("[Prompt] Background error:", err);
     });
   }
@@ -348,13 +349,11 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     if (!lastPromptText) { await ctx.reply("Aucun prompt à relancer."); return; }
     const sid = sessionManager.currentSessionId;
     if (!sid) { await ctx.reply("No session. Use /start."); return; }
-    const upload = pendingUpload;
-    pendingUpload = null;
     const job: QueuedPrompt = {
       text: lastPromptText,
       messageId: ctx.message?.message_id ?? 0,
       chatId: ctx.chat?.id ?? config.telegram.allowedUserId,
-      upload,
+      upload: lastPromptUpload,
     };
     if (busy) {
       promptQueue.enqueue(job);
@@ -492,18 +491,22 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
     }
   });
 
-  async function runPrompt(acpClient: AcpClient, ctx: Context, sid: string, generation: number, stopTyping?: () => void, retry = 0) {
+  async function runPrompt(acpClient: AcpClient, ctx: Context, sid: string, generation: number, stopTyping?: () => void, retry = 0, upload: string | null = null) {
     const text = ctx.message?.text;
-    if (!text) return;
+    if (!text) {
+      stopTyping?.();
+      return;
+    }
     // Clean up input text — trim whitespace, collapse excessive newlines
     const cleanText = text.trim().replace(/\n{3,}/g, '\n\n').replace(/[ \t]+$/gm, '');
     let effectiveText = cleanText;
-    if (pendingUpload) {
-      const relPath = pendingUpload.startsWith(config.vibe.projectDir)
-        ? pendingUpload.slice(config.vibe.projectDir.length + 1)
-        : pendingUpload;
+    // Uploads are carried per prompt so a file sent while another prompt is
+    // queued stays attached to the message it was sent with.
+    if (upload) {
+      const relPath = upload.startsWith(config.vibe.projectDir)
+        ? upload.slice(config.vibe.projectDir.length + 1)
+        : upload;
       effectiveText = `[File uploaded to ${relPath}]\n\n${cleanText}`;
-      pendingUpload = null;
     }
     let recovered = false;
     try {
@@ -633,7 +636,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
           }
           recovered = true;
           effectiveText = `[retry after auth error]\n\n${effectiveText}`;
-          await runPrompt(acpClient, ctx, sid, generation, stopTyping, retry + 1);
+          await runPrompt(acpClient, ctx, sid, generation, stopTyping, retry + 1, upload);
           return;
         }
         logger.error("[Bot] Auth error — permanent after retry:", msg);
@@ -659,7 +662,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
         await new Promise(r => setTimeout(r, backoff));
         recovered = true;
         effectiveText = `[retry after timeout]\n\n${effectiveText}`;
-        await runPrompt(acpClient, ctx, sid, generation, stopTyping, retry + 1);
+        await runPrompt(acpClient, ctx, sid, generation, stopTyping, retry + 1, upload);
         return;
       }
 
@@ -677,7 +680,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
           await responseStreamer.start(generation, ctx.message.message_id);
           await ctx.reply(`🔄 Session rechargée. Je relance...`);
           recovered = true;
-          await runPrompt(acpClient, ctx, sid, generation, stopTyping, retry + 1);
+          await runPrompt(acpClient, ctx, sid, generation, stopTyping, retry + 1, upload);
           return;
         } catch (loadErr) {
           logger.warn(`[Bot] Session ${sid.slice(0, 8)}... load failed, creating new:`, loadErr);
@@ -691,7 +694,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
           await responseStreamer.start(generation, ctx.message.message_id);
           await ctx.reply(`🔄 Nouvelle session créée. Je relance...`);
           recovered = true;
-          await runPrompt(acpClient, ctx, newSid, generation, stopTyping, retry + 1);
+          await runPrompt(acpClient, ctx, newSid, generation, stopTyping, retry + 1, upload);
           return;
         } catch (createErr) {
           logger.error("[Bot] Session recovery failed:", createErr);
@@ -712,7 +715,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
             await acpClient.initialize();
             const newSid = await sessionManager.createSession(recoveryCwd);
             recovered = true;
-            await runPrompt(acpClient, ctx, newSid, generation, stopTyping, retry + 1);
+            await runPrompt(acpClient, ctx, newSid, generation, stopTyping, retry + 1, upload);
             return;
           } catch (restartErr) {
             logger.error("[Bot] ACP restart recovery also failed:", restartErr);
@@ -742,7 +745,7 @@ export async function createBot(acpClient: AcpClient, sessionManager: SessionMan
             await acpClient.initialize();
             const newSid = await sessionManager.createSession(recoveryCwd);
             recovered = true;
-            await runPrompt(acpClient, ctx, newSid, generation, stopTyping, retry + 1);
+            await runPrompt(acpClient, ctx, newSid, generation, stopTyping, retry + 1, upload);
             return;
           } catch (restartErr) {
             logger.error("[Bot] ACP restart recovery failed for non-session error:", restartErr);
