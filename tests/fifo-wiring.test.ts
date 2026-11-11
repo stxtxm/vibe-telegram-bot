@@ -623,6 +623,33 @@ describe("câblage FIFO de createBot", () => {
     expect(await statusText()).not.toContain("Busy");
   });
 
+  it("affiche « Réparation impossible » quand le redémarrage ACP échoue", async () => {
+    await textHandler()(makeCtx("premier").ctx);
+
+    sm.loadSession.mockRejectedValueOnce(new Error("cannot load session"));
+    sm.createSession.mockRejectedValueOnce(new Error("cannot create session"));
+    acp.start.mockRejectedValueOnce(new Error("acp won't start"));
+
+    acp.resolvers.shift()?.(new Error("Session not found"));
+
+    await vi.waitFor(
+      () => {
+        const sent = h.api.sendMessage.mock.calls.map(([, text]) => text).join("\n");
+        expect(sent).toContain("Réparation impossible");
+      },
+      { timeout: 4000 },
+    );
+    expect(acp.stop).toHaveBeenCalledWith(true);
+    expect(acp.start).toHaveBeenCalled();
+    // start a échoué : initialize n'est jamais atteint, aucune relance ne part.
+    expect(acp.initialize).not.toHaveBeenCalled();
+    expect(acp.prompts).toHaveLength(1);
+    expect(h.streamer.finalize).not.toHaveBeenCalled();
+
+    await settle();
+    expect(await statusText()).not.toContain("Busy");
+  });
+
   it("/abort sans prompt en cours ne fait rien", async () => {
     const abort = makeCtx("/abort");
     await command("abort")(abort.ctx);
