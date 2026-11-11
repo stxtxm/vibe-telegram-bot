@@ -44,7 +44,6 @@ import { ResponseStreamer } from "./stream.js";
 import {
   parseFileAction,
   buildFileMenu,
-  changeDirectory,
   getFileContent,
   type FileAction,
 } from "./files.js";

@@ -135,7 +135,7 @@ describe("KeyboardManager", () => {
     expect(Keyboard).toHaveBeenCalled();
   });
 
-  it("should debounce refreshKeyboard calls", () => {
+  it("should debounce refreshKeyboard calls without spamming keyboard messages", () => {
     const km = makeKm();
     const spy = spyOnSend(km);
 
@@ -147,29 +147,25 @@ describe("KeyboardManager", () => {
 
     vi.advanceTimersByTime(2000);
 
-    expect(spy).toHaveBeenCalledTimes(1);
+    // Intentionally no-op: keyboard is attached to replies/status updates instead of spam messages.
+    expect(spy).not.toHaveBeenCalled();
   });
 
-  it("should flushKeyboard immediately", () => {
+  it("should flushKeyboard immediately without sending keyboard spam", () => {
     const km = makeKm();
     const spy = spyOnSend(km);
 
     km.refreshKeyboard();
     km.flushKeyboard();
 
-    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).not.toHaveBeenCalled();
   });
 
-  it("should send persistent keyboard without deleting it", async () => {
+  it("sendKeyboardUpdate is a no-op (keyboard attached to replies instead)", async () => {
     const km = makeKm();
     await km["sendKeyboardUpdate"]();
 
-    expect(bot.api.sendMessage).toHaveBeenCalledWith(
-      chatId,
-      "⌨️ clavier",
-      expect.objectContaining({ disable_notification: true }),
-    );
-    // Deleting the message would remove the persistent reply keyboard
+    expect(bot.api.sendMessage).not.toHaveBeenCalled();
     expect(bot.api.deleteMessage).not.toHaveBeenCalled();
   });
 

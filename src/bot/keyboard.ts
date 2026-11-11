@@ -1,5 +1,4 @@
 import { Keyboard, type Bot, type Context } from "grammy";
-import { logger } from "../utils/logger.js";
 
 const UPDATE_DEBOUNCE_MS = 2_000;
 
