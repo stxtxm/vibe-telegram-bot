@@ -137,7 +137,7 @@ vi.mock("../src/bot/keyboard.js", () => ({
 import { createBot } from "../src/bot/index.js";
 
 function makeAcp() {
-  const resolvers: Array<() => void> = [];
+  const resolvers: Array<(error?: Error) => void> = [];
   const prompts: Array<{ sessionId: string; text: string }> = [];
   const listeners: Array<(msg: unknown) => void> = [];
   return {
@@ -147,8 +147,8 @@ function makeAcp() {
     // Each prompt stays pending until the test resolves it, like a long Vibe run.
     sendPrompt: vi.fn((sessionId: string, text: string) => {
       prompts.push({ sessionId, text });
-      return new Promise<unknown>((resolve) => {
-        resolvers.push(() => resolve(undefined));
+      return new Promise<unknown>((resolve, reject) => {
+        resolvers.push((error) => (error ? reject(error) : resolve(undefined)));
       });
     }),
     cancelPrompt: vi.fn(),
@@ -483,6 +483,36 @@ describe("câblage FIFO de createBot", () => {
 
     acp.resolvers.shift()?.();
     await settle();
+  });
+
+  it("continue de vider la file quand un prompt échoue", async () => {
+    await textHandler()(makeCtx("premier").ctx);
+    const second = makeCtx("deuxieme");
+    await textHandler()(second.ctx);
+    expect(acp.prompts).toHaveLength(1);
+
+    // Première tentative : erreur générique → réparation ACP puis seconde tentative.
+    acp.resolvers.shift()?.(new Error("boom"));
+    await vi.waitFor(() => expect(acp.prompts).toHaveLength(2), { timeout: 4000 });
+    expect(acp.prompts[1].text).toBe("premier");
+    expect(h.api.sendMessage.mock.calls.map(([, text]) => text).join("\n")).toContain(
+      "🔄 Réparation automatique...",
+    );
+
+    // Seconde tentative : échec définitif, la file doit reprendre.
+    acp.resolvers.shift()?.(new Error("boom définitif"));
+    await vi.waitFor(() => expect(acp.prompts).toHaveLength(3), { timeout: 4000 });
+    expect(acp.prompts[2].text).toBe("deuxieme");
+    expect(h.api.sendMessage.mock.calls.map(([, text]) => text).join("\n")).toContain(
+      "❌ boom définitif",
+    );
+
+    acp.resolvers.shift()?.();
+    await settle();
+
+    const idle = await statusText();
+    expect(idle).not.toContain("Busy");
+    expect(idle).not.toContain("File d'attente");
   });
 
   it("/abort sans prompt en cours ne fait rien", async () => {
