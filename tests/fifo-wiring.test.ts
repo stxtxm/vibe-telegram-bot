@@ -572,6 +572,30 @@ describe("câblage FIFO de createBot", () => {
     expect(await statusText()).not.toContain("Busy");
   });
 
+  it("crée une nouvelle session quand le rechargement échoue", async () => {
+    await textHandler()(makeCtx("premier").ctx);
+
+    sm.loadSession.mockRejectedValueOnce(new Error("cannot load session"));
+    sm.createSession.mockResolvedValueOnce("session-2");
+
+    acp.resolvers.shift()?.(new Error("Session not found"));
+
+    await vi.waitFor(() => expect(acp.prompts).toHaveLength(2), { timeout: 4000 });
+    expect(sm.loadSession).toHaveBeenCalledWith("session-1", "/project");
+    expect(sm.createSession).toHaveBeenCalledWith("/project");
+    // La relance doit utiliser l'identifiant de la nouvelle session.
+    expect(acp.prompts[1]).toEqual({ sessionId: "session-2", text: "premier" });
+
+    const sent = h.api.sendMessage.mock.calls.map(([, text]) => text).join("\n");
+    expect(sent).toContain("Nouvelle session créée");
+
+    acp.resolvers.shift()?.();
+    await vi.waitFor(() => expect(h.streamer.finalize).toHaveBeenCalled(), { timeout: 3000 });
+    await settle();
+
+    expect(await statusText()).not.toContain("Busy");
+  });
+
   it("/abort sans prompt en cours ne fait rien", async () => {
     const abort = makeCtx("/abort");
     await command("abort")(abort.ctx);
