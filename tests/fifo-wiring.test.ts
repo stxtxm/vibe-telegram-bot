@@ -247,6 +247,11 @@ const command = (name: string) => h.commands.get(name) as Handler;
 
 const settle = (ms = 40) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+/** Laisse progresser les chaînes async quand les timers sont simulés. */
+async function flushMicrotasks(times = 40) {
+  for (let i = 0; i < times; i++) await Promise.resolve();
+}
+
 function extractUpload(text: string): string | null {
   const match = text.match(/\[File uploaded to (.+?)\]/);
   return match ? match[1] : null;
@@ -492,22 +497,34 @@ describe("câblage FIFO de createBot", () => {
     expect(acp.prompts).toHaveLength(1);
 
     // Première tentative : erreur générique → réparation ACP puis seconde tentative.
-    acp.resolvers.shift()?.(new Error("boom"));
-    await vi.waitFor(() => expect(acp.prompts).toHaveLength(2), { timeout: 4000 });
-    expect(acp.prompts[1].text).toBe("premier");
-    expect(h.api.sendMessage.mock.calls.map(([, text]) => text).join("\n")).toContain(
-      "🔄 Réparation automatique...",
-    );
+    vi.useFakeTimers();
+    try {
+      acp.resolvers.shift()?.(new Error("boom"));
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(1000);
+      await flushMicrotasks();
+      expect(acp.prompts).toHaveLength(2);
+      expect(acp.prompts[1].text).toBe("premier");
+      expect(h.api.sendMessage.mock.calls.map(([, text]) => text).join("\n")).toContain(
+        "🔄 Réparation automatique...",
+      );
 
-    // Seconde tentative : échec définitif, la file doit reprendre.
-    acp.resolvers.shift()?.(new Error("boom définitif"));
-    await vi.waitFor(() => expect(acp.prompts).toHaveLength(3), { timeout: 4000 });
-    expect(acp.prompts[2].text).toBe("deuxieme");
-    expect(h.api.sendMessage.mock.calls.map(([, text]) => text).join("\n")).toContain(
-      "❌ boom définitif",
-    );
+      // Seconde tentative : échec définitif, la file doit reprendre.
+      acp.resolvers.shift()?.(new Error("boom définitif"));
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(acp.prompts).toHaveLength(3);
+      expect(acp.prompts[2].text).toBe("deuxieme");
+      expect(h.api.sendMessage.mock.calls.map(([, text]) => text).join("\n")).toContain(
+        "❌ boom définitif",
+      );
 
-    acp.resolvers.shift()?.();
+      acp.resolvers.shift()?.();
+      await flushMicrotasks();
+    } finally {
+      vi.useRealTimers();
+    }
+
     await settle();
 
     const idle = await statusText();
@@ -518,20 +535,32 @@ describe("câblage FIFO de createBot", () => {
   it("relance automatiquement après une erreur d'authentification", async () => {
     await textHandler()(makeCtx("premier").ctx);
 
-    acp.resolvers.shift()?.(new Error("Unauthorized: invalid api key"));
+    vi.useFakeTimers();
+    try {
+      acp.resolvers.shift()?.(new Error("Unauthorized: invalid api key"));
+      await flushMicrotasks();
+      // 500 ms avant restartAcp, puis 1000 ms dans restartAcp.
+      await vi.advanceTimersByTimeAsync(2000);
+      await flushMicrotasks();
 
-    await vi.waitFor(() => expect(acp.prompts).toHaveLength(2), { timeout: 4000 });
-    expect(acp.prompts[1].text).toBe("[retry after auth error]\n\npremier");
-    expect(acp.stop).toHaveBeenCalledWith(true);
-    expect(acp.start).toHaveBeenCalled();
-    expect(acp.initialize).toHaveBeenCalled();
-    expect(sm.loadSession).toHaveBeenCalledWith("session-1", "/project");
+      expect(acp.prompts).toHaveLength(2);
+      expect(acp.prompts[1].text).toBe("[retry after auth error]\n\npremier");
+      expect(acp.stop).toHaveBeenCalledWith(true);
+      expect(acp.start).toHaveBeenCalled();
+      expect(acp.initialize).toHaveBeenCalled();
+      expect(sm.loadSession).toHaveBeenCalledWith("session-1", "/project");
 
-    const sent = h.api.sendMessage.mock.calls.map(([, text]) => text).join("\n");
-    expect(sent).toContain("Erreur d'authentification");
+      const sent = h.api.sendMessage.mock.calls.map(([, text]) => text).join("\n");
+      expect(sent).toContain("Erreur d'authentification");
 
-    acp.resolvers.shift()?.();
-    await vi.waitFor(() => expect(h.streamer.finalize).toHaveBeenCalled(), { timeout: 3000 });
+      acp.resolvers.shift()?.();
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(h.streamer.finalize).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+
     await settle();
 
     expect(await statusText()).not.toContain("Busy");
@@ -540,15 +569,26 @@ describe("câblage FIFO de createBot", () => {
   it("préfixe la relance d'une erreur API retryable", async () => {
     await textHandler()(makeCtx("premier").ctx);
 
-    acp.resolvers.shift()?.(new Error("PoolTimeout"));
+    vi.useFakeTimers();
+    try {
+      acp.resolvers.shift()?.(new Error("PoolTimeout"));
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(1000);
+      await flushMicrotasks();
 
-    await vi.waitFor(() => expect(acp.prompts).toHaveLength(2), { timeout: 4000 });
-    expect(acp.prompts[1].text).toBe("[retry after timeout]\n\npremier");
-    const sent = h.api.sendMessage.mock.calls.map(([, text]) => text).join("\n");
-    expect(sent).toContain("Nouvelle tentative dans 1s");
+      expect(acp.prompts).toHaveLength(2);
+      expect(acp.prompts[1].text).toBe("[retry after timeout]\n\npremier");
+      const sent = h.api.sendMessage.mock.calls.map(([, text]) => text).join("\n");
+      expect(sent).toContain("Nouvelle tentative dans 1s");
 
-    acp.resolvers.shift()?.();
-    await vi.waitFor(() => expect(h.streamer.finalize).toHaveBeenCalled(), { timeout: 3000 });
+      acp.resolvers.shift()?.();
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(h.streamer.finalize).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+
     await settle();
   });
 
@@ -604,20 +644,31 @@ describe("câblage FIFO de createBot", () => {
       .mockRejectedValueOnce(new Error("cannot create session"))
       .mockResolvedValueOnce("session-3");
 
-    acp.resolvers.shift()?.(new Error("Session not found"));
+    vi.useFakeTimers();
+    try {
+      acp.resolvers.shift()?.(new Error("Session not found"));
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(1000);
+      await flushMicrotasks();
 
-    await vi.waitFor(() => expect(acp.prompts).toHaveLength(2), { timeout: 4000 });
-    expect(sm.createSession).toHaveBeenCalledTimes(2);
-    expect(acp.stop).toHaveBeenCalledWith(true);
-    expect(acp.start).toHaveBeenCalled();
-    expect(acp.initialize).toHaveBeenCalled();
-    expect(acp.prompts[1]).toEqual({ sessionId: "session-3", text: "premier" });
+      expect(acp.prompts).toHaveLength(2);
+      expect(sm.createSession).toHaveBeenCalledTimes(2);
+      expect(acp.stop).toHaveBeenCalledWith(true);
+      expect(acp.start).toHaveBeenCalled();
+      expect(acp.initialize).toHaveBeenCalled();
+      expect(acp.prompts[1]).toEqual({ sessionId: "session-3", text: "premier" });
 
-    const sent = h.api.sendMessage.mock.calls.map(([, text]) => text).join("\n");
-    expect(sent).toContain("Réparation automatique");
+      const sent = h.api.sendMessage.mock.calls.map(([, text]) => text).join("\n");
+      expect(sent).toContain("Réparation automatique");
 
-    acp.resolvers.shift()?.();
-    await vi.waitFor(() => expect(h.streamer.finalize).toHaveBeenCalled(), { timeout: 3000 });
+      acp.resolvers.shift()?.();
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(h.streamer.finalize).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+
     await settle();
 
     expect(await statusText()).not.toContain("Busy");
@@ -630,21 +681,24 @@ describe("câblage FIFO de createBot", () => {
     sm.createSession.mockRejectedValueOnce(new Error("cannot create session"));
     acp.start.mockRejectedValueOnce(new Error("acp won't start"));
 
-    acp.resolvers.shift()?.(new Error("Session not found"));
+    vi.useFakeTimers();
+    try {
+      acp.resolvers.shift()?.(new Error("Session not found"));
+      await flushMicrotasks();
+      await vi.advanceTimersByTimeAsync(1000);
+      await flushMicrotasks();
 
-    await vi.waitFor(
-      () => {
-        const sent = h.api.sendMessage.mock.calls.map(([, text]) => text).join("\n");
-        expect(sent).toContain("Réparation impossible");
-      },
-      { timeout: 4000 },
-    );
-    expect(acp.stop).toHaveBeenCalledWith(true);
-    expect(acp.start).toHaveBeenCalled();
-    // start a échoué : initialize n'est jamais atteint, aucune relance ne part.
-    expect(acp.initialize).not.toHaveBeenCalled();
-    expect(acp.prompts).toHaveLength(1);
-    expect(h.streamer.finalize).not.toHaveBeenCalled();
+      const sent = h.api.sendMessage.mock.calls.map(([, text]) => text).join("\n");
+      expect(sent).toContain("Réparation impossible");
+      expect(acp.stop).toHaveBeenCalledWith(true);
+      expect(acp.start).toHaveBeenCalled();
+      // start a échoué : initialize n'est jamais atteint, aucune relance ne part.
+      expect(acp.initialize).not.toHaveBeenCalled();
+      expect(acp.prompts).toHaveLength(1);
+      expect(h.streamer.finalize).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
 
     await settle();
     expect(await statusText()).not.toContain("Busy");
