@@ -515,6 +515,30 @@ describe("câblage FIFO de createBot", () => {
     expect(idle).not.toContain("File d'attente");
   });
 
+  it("relance automatiquement après une erreur d'authentification", async () => {
+    await textHandler()(makeCtx("premier").ctx);
+
+    acp.resolvers.shift()?.(new Error("Unauthorized: invalid api key"));
+
+    await vi.waitFor(() => expect(acp.prompts).toHaveLength(2), { timeout: 4000 });
+    // runPrompt reconstruit le texte depuis ctx : le préfixe [retry after auth error]
+    // assigné dans le catch n'est pas transmis à la tentative suivante.
+    expect(acp.prompts[1].text).toBe("premier");
+    expect(acp.stop).toHaveBeenCalledWith(true);
+    expect(acp.start).toHaveBeenCalled();
+    expect(acp.initialize).toHaveBeenCalled();
+    expect(sm.loadSession).toHaveBeenCalledWith("session-1", "/project");
+
+    const sent = h.api.sendMessage.mock.calls.map(([, text]) => text).join("\n");
+    expect(sent).toContain("Erreur d'authentification");
+
+    acp.resolvers.shift()?.();
+    await vi.waitFor(() => expect(h.streamer.finalize).toHaveBeenCalled(), { timeout: 3000 });
+    await settle();
+
+    expect(await statusText()).not.toContain("Busy");
+  });
+
   it("/abort sans prompt en cours ne fait rien", async () => {
     const abort = makeCtx("/abort");
     await command("abort")(abort.ctx);
